@@ -1,0 +1,740 @@
+#!/usr/bin/env python3
+"""claude-history : lecteur local de toutes les conversations Claude Code.
+
+Usage : claude-history [port] [--no-open]
+Lit ~/.claude/projects en lecture seule et sert une interface sur 127.0.0.1.
+"""
+import html
+import json
+import re
+import sys
+import urllib.parse
+import webbrowser
+from collections import Counter
+from datetime import date, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+HOME = str(Path.home())
+ROOT = Path.home() / ".claude" / "projects"
+CACHE_FILE = Path.home() / ".cache" / "claude-history" / "index.json"
+SAFE = re.compile(r"^[A-Za-z0-9._-]+$")
+REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+COMMAND = re.compile(r"<command-name>(.*?)</command-name>(?:.*?<command-args>(.*?)</command-args>)?", re.S)
+MAX_BLOCK = 20000
+JOURS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+MOIS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août",
+        "septembre", "octobre", "novembre", "décembre"]
+CACHE = {}
+
+FONTS = (
+    "<link rel=preconnect href=https://fonts.googleapis.com>"
+    "<link rel=preconnect href=https://fonts.gstatic.com crossorigin>"
+    "<link rel=stylesheet href='https://fonts.googleapis.com/css2?"
+    "family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700"
+    "&family=Hanken+Grotesk:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap'>"
+)
+
+CSS = """
+:root{
+  --paper:#edf1ef;--surface:#f9fbfa;--ink:#10272b;--mut:#587074;--line:#cdd8d5;
+  --petrol:#0e6b62;--coral:#cf4526;--coral-tint:#fbe8e1;--marker:#ffd84d;--code:#e2e9e7;
+  --display:"Bricolage Grotesque",system-ui,sans-serif;
+  --body:"Hanken Grotesk",system-ui,sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,"Cascadia Code",monospace;
+}
+@media(prefers-color-scheme:dark){:root{
+  --paper:#0d1618;--surface:#132124;--ink:#e2ecea;--mut:#88a09f;--line:#243639;
+  --petrol:#58c9b8;--coral:#ff8b6b;--coral-tint:#2b1c18;--code:#1a2b2e;
+}}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html{scroll-padding-top:24px}
+body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.6 var(--body);-webkit-font-smoothing:antialiased}
+a{color:var(--petrol)}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;text-align:left}
+:focus-visible{outline:2px solid var(--coral);outline-offset:2px;border-radius:4px}
+.app{display:grid;grid-template-columns:300px minmax(0,1fr);min-height:100vh}
+
+/* colonne de gauche */
+.side{border-right:1px solid var(--line);padding:28px 18px 40px 24px;position:sticky;top:0;height:100vh;overflow-y:auto}
+.brand{display:block;font:700 26px/1 var(--display);letter-spacing:-.03em;color:var(--ink);text-decoration:none}
+.brand i{font-style:normal;color:var(--coral)}
+.tag{font:12px var(--mono);color:var(--mut);margin:8px 0 28px}
+.cap{font:500 11px var(--mono);letter-spacing:.09em;text-transform:uppercase;color:var(--mut);margin:0 0 8px}
+.fold{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 10px;width:100%;padding:7px 10px;margin-left:-10px;border-radius:7px;align-items:baseline}
+.fold:hover{background:var(--surface)}
+.fold[aria-pressed=true]{background:var(--ink);color:var(--paper)}
+.fold b{font-weight:600;font-size:14.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fold s{text-decoration:none;font:12px var(--mono);opacity:.65}
+.fold small{grid-column:1/-1;font:11.5px var(--mono);opacity:.6;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:left}
+.toc{list-style:none;margin:0;padding:0;border-left:1px solid var(--line)}
+.toc a{display:block;padding:6px 0 6px 12px;margin-left:-1px;border-left:2px solid transparent;font-size:13.5px;line-height:1.35;color:var(--mut);text-decoration:none}
+.toc a span{overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow-wrap:anywhere}
+.toc a:hover{color:var(--ink)}
+.toc a.on{color:var(--ink);border-left-color:var(--coral)}
+.back{display:inline-block;font:13px var(--mono);margin-bottom:26px;text-decoration:none}
+.back:hover{text-decoration:underline}
+
+/* colonne principale */
+.main{padding:28px clamp(18px,4vw,56px) 96px;min-width:0}
+.find{display:flex;gap:10px;margin-bottom:22px}
+.find input{flex:1;min-width:0;padding:12px 16px;font:16px var(--body);color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:10px}
+.find input::placeholder{color:var(--mut)}
+.find button{padding:0 18px;border-radius:10px;background:var(--ink);color:var(--paper);font-weight:600;font-size:14.5px;white-space:nowrap}
+.find button:hover{background:var(--petrol)}
+.hint{font-size:13px;color:var(--mut);margin:-14px 0 22px}
+kbd{font:12px var(--mono);border:1px solid var(--line);border-radius:4px;padding:1px 5px;background:var(--surface)}
+
+/* ruban d'activité */
+.ribbon{margin:0 0 30px}
+.bars{display:flex;align-items:flex-end;gap:2px;height:64px;border-bottom:1px solid var(--line)}
+.bar{flex:1;min-width:2px;height:100%;display:flex;align-items:flex-end;padding:0}
+.bar span{display:block;width:100%;height:var(--h);min-height:2px;background:var(--petrol);border-radius:2px 2px 0 0;transition:background .12s}
+.bar.none span{background:var(--line);min-height:1px;height:1px}
+.bar:hover span{background:var(--ink)}
+.bar[aria-pressed=true] span{background:var(--coral)}
+.ends{display:flex;justify-content:space-between;font:11.5px var(--mono);color:var(--mut);margin-top:6px}
+
+/* liste */
+.count{font:13px var(--mono);color:var(--mut);margin:0 0 4px}
+.reset{font:13px var(--mono);color:var(--coral);text-decoration:underline;margin-left:10px}
+.day h2{font:700 21px/1.2 var(--display);letter-spacing:-.02em;margin:30px 0 8px}
+.row{display:grid;grid-template-columns:52px minmax(0,1fr) minmax(0,220px) 60px;gap:16px;align-items:baseline;padding:11px 12px;margin:0 -12px;color:inherit;text-decoration:none;border-top:1px solid var(--line)}
+.day .row:first-of-type{border-top-color:transparent}
+.row:hover{background:var(--surface)}
+.row:hover b{color:var(--petrol)}
+.row time,.row .rp,.row .rn{font:12.5px var(--mono);color:var(--mut)}
+.row b{display:block;font-weight:600;font-size:16px;line-height:1.35}
+.row .rf{display:block;font-size:14px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row .rp{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:right}
+.row .rn{text-align:right}
+.empty{padding:40px 0;color:var(--mut)}
+
+/* lecture */
+.read{max-width:780px}
+.path{font:13px var(--mono);color:var(--mut);overflow-wrap:anywhere}
+.read h1{font:700 clamp(28px,4vw,40px)/1.08 var(--display);letter-spacing:-.035em;margin:8px 0 10px}
+.meta{font:13px var(--mono);color:var(--mut);margin-bottom:18px}
+.resume{display:flex;gap:10px;align-items:stretch;margin-bottom:14px}
+.resume code{flex:1;min-width:0;font:13px var(--mono);background:var(--code);padding:10px 12px;border-radius:8px;overflow-x:auto;white-space:nowrap}
+.btn{padding:0 14px;border:1px solid var(--line);border-radius:8px;font-size:13.5px;font-weight:600;white-space:nowrap;background:var(--surface)}
+.btn:hover{border-color:var(--ink)}
+.tools{display:flex;gap:10px;margin-bottom:34px}
+.tools .btn{padding:7px 14px}
+.who{font:500 11px var(--mono);letter-spacing:.09em;text-transform:uppercase;margin:0 0 6px;display:flex;gap:10px}
+.who span{color:var(--mut);letter-spacing:0;text-transform:none}
+.ask{background:var(--coral-tint);border-left:3px solid var(--coral);border-radius:0 10px 10px 0;padding:14px 18px;margin:44px 0 22px;overflow-wrap:anywhere}
+.ask .who{color:var(--coral)}
+.ask .t{white-space:pre-wrap;font-size:16.5px}
+.ask.cmd{background:none;padding:6px 18px;font:13.5px var(--mono);color:var(--mut)}
+.say{margin:18px 0;overflow-wrap:anywhere}
+.say>.who{color:var(--petrol)}
+.say p{margin:0 0 12px}
+.say h3,.say h4,.say h5{font-family:var(--display);letter-spacing:-.015em;line-height:1.25;margin:24px 0 8px}
+.say h3{font-size:22px}.say h4{font-size:18.5px}.say h5{font-size:16px}
+.say ul,.say ol{margin:0 0 12px;padding-left:22px}
+.say li{margin:3px 0}
+.say li.d1{margin-left:20px}.say li.d2{margin-left:40px}
+.say blockquote{margin:0 0 12px;padding-left:14px;border-left:2px solid var(--line);color:var(--mut)}
+.say hr{border:0;border-top:1px solid var(--line);margin:20px 0}
+.say table{border-collapse:collapse;margin:0 0 14px;font-size:14.5px;display:block;overflow-x:auto}
+.say th,.say td{border-bottom:1px solid var(--line);padding:6px 14px 6px 0;text-align:left;vertical-align:top}
+.say th{font:500 11.5px var(--mono);letter-spacing:.05em;text-transform:uppercase;color:var(--mut)}
+code{font:.86em var(--mono);background:var(--code);padding:1.5px 5px;border-radius:4px}
+pre{font:13px/1.5 var(--mono);background:var(--code);padding:12px 14px;border-radius:8px;overflow-x:auto;margin:0 0 12px;white-space:pre-wrap;overflow-wrap:anywhere}
+pre code{background:none;padding:0;font-size:inherit}
+.act{margin:10px 0;border-left:1px dashed var(--line);padding-left:14px}
+.act>summary{font:12.5px var(--mono);color:var(--mut);cursor:pointer;padding:3px 0;list-style-position:outside}
+.act>summary:hover{color:var(--ink)}
+.step{margin:6px 0}
+.step>summary{font:12.5px var(--mono);cursor:pointer;color:var(--mut);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.step>summary b{color:var(--ink);font-weight:500}
+.step pre{margin:6px 0;max-height:420px;overflow-y:auto}
+.rl{font:11px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--mut);margin-top:8px}
+.cut{text-align:center;font:12px var(--mono);color:var(--mut);margin:36px 0;display:flex;gap:14px;align-items:center}
+.cut::before,.cut::after{content:"";flex:1;border-top:1px dashed var(--line)}
+mark{background:var(--marker);color:#10272b;padding:0 2px;border-radius:2px}
+.ask:target,.say:target{box-shadow:-8px 0 0 var(--paper),-11px 0 0 var(--marker)}
+
+/* résultats de recherche */
+.hitset{border-top:1px solid var(--line);padding:18px 0}
+.hitset h2{font:600 17px/1.3 var(--body);margin:0}
+.hitset h2 a{color:var(--ink);text-decoration:none}
+.hitset h2 a:hover{color:var(--petrol)}
+.hit{display:grid;grid-template-columns:62px minmax(0,1fr);gap:12px;padding:7px 0;font-size:14.5px;color:inherit;text-decoration:none;overflow-wrap:anywhere}
+.hit:hover{background:var(--surface)}
+.hit i{font:500 11px/2 var(--mono);font-style:normal;letter-spacing:.08em;text-transform:uppercase;color:var(--petrol)}
+.hit i.u{color:var(--coral)}
+.more{font:12.5px var(--mono);color:var(--mut);padding-left:74px}
+
+@media(max-width:860px){
+  .app{grid-template-columns:1fr}
+  .side{position:static;height:auto;max-height:260px;border-right:0;border-bottom:1px solid var(--line);padding:20px 18px}
+  .tag{margin-bottom:16px}
+  .row{grid-template-columns:48px minmax(0,1fr);gap:10px}
+  .row .rp,.row .rn{display:none}
+  .find button{padding:0 14px}.lg{display:none}
+  .resume{flex-direction:column}.resume .btn{padding:9px 14px}
+}
+@media(prefers-reduced-motion:reduce){*{transition:none!important;scroll-behavior:auto!important}}
+"""
+
+JS_INDEX = """
+const rows=[...document.querySelectorAll('.row')],days=[...document.querySelectorAll('.day')],
+q=document.getElementById('q'),cnt=document.getElementById('cnt'),empty=document.getElementById('empty'),
+reset=document.getElementById('reset'),term=document.getElementById('term');
+let F='',D='';
+function apply(){
+  const v=q.value.trim().toLowerCase();let n=0;
+  rows.forEach(r=>{const ok=(!F||r.dataset.f===F)&&(!D||r.dataset.d===D)&&(!v||r.dataset.k.includes(v));r.hidden=!ok;if(ok)n++});
+  days.forEach(d=>{d.hidden=!d.querySelector('.row:not([hidden])')});
+  cnt.textContent=n+(n>1?' conversations':' conversation');
+  empty.hidden=n>0;term.textContent=q.value.trim();
+  reset.hidden=!(F||D||v);
+  document.querySelectorAll('.fold').forEach(b=>b.setAttribute('aria-pressed',b.dataset.f===F));
+  document.querySelectorAll('.bar').forEach(b=>b.setAttribute('aria-pressed',b.dataset.d===D));
+}
+document.querySelectorAll('.fold').forEach(b=>b.onclick=()=>{F=b.dataset.f;apply()});
+document.querySelectorAll('.bar').forEach(b=>b.onclick=()=>{D=D===b.dataset.d?'':b.dataset.d;apply()});
+reset.onclick=()=>{F='';D='';q.value='';apply();q.focus()};
+q.oninput=apply;
+document.addEventListener('keydown',e=>{
+  if(e.key==='/'&&document.activeElement!==q){e.preventDefault();q.focus();q.select()}
+  if(e.key==='Escape'&&document.activeElement===q){q.value='';apply()}
+});
+apply();
+"""
+
+JS_READ = """
+const cp=document.getElementById('cp');
+cp.onclick=()=>navigator.clipboard.writeText(document.getElementById('cmd').textContent).then(()=>{cp.textContent='Commande copiée';setTimeout(()=>cp.textContent='Copier la commande',1600)});
+const tg=document.getElementById('tg');let open=false;
+tg.onclick=()=>{open=!open;document.querySelectorAll('.act').forEach(d=>d.open=open);tg.textContent=open?'Replier les actions':'Déplier les actions'};
+const links=new Map([...document.querySelectorAll('.toc a')].map(a=>[a.getAttribute('href').slice(1),a]));
+const io=new IntersectionObserver(es=>es.forEach(e=>{if(e.isIntersecting){links.forEach(a=>a.classList.remove('on'));const a=links.get(e.target.id);if(a){a.classList.add('on');a.scrollIntoView({block:'nearest'})}}}),{rootMargin:'0px 0px -70% 0px'});
+document.querySelectorAll('.ask[id]').forEach(el=>io.observe(el));
+if(location.hash){const t=document.getElementById(location.hash.slice(1));if(t)t.scrollIntoView()}
+"""
+
+
+def esc(s):
+    return html.escape(str(s), quote=True)
+
+
+def shell(title, side, main, script=""):
+    return (
+        "<!doctype html><html lang=fr><head><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        f"<title>{esc(title)}</title>{FONTS}<style>{CSS}</style></head><body>"
+        f"<div class=app><aside class=side>{side}</aside><main class=main>{main}</main></div>"
+        f"<script>{script}</script></body></html>"
+    ).encode("utf-8")
+
+
+BRAND = "<a class=brand href='/'>journal<i>.</i></a><p class=tag>tes conversations Claude Code</p>"
+
+
+# ---------- lecture des fichiers ----------
+
+def iter_records(path):
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if line.startswith('{"type":"api-request'):
+                continue
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(o, dict):
+                yield o
+
+
+def blocks(o):
+    m = o.get("message")
+    c = m.get("content") if isinstance(m, dict) else None
+    if isinstance(c, str):
+        return [{"type": "text", "text": c}]
+    if isinstance(c, list):
+        return [b for b in c if isinstance(b, dict)]
+    return []
+
+
+def plain(o):
+    return "\n".join(b.get("text", "") for b in blocks(o) if b.get("type") == "text")
+
+
+def clean(text):
+    return REMINDER.sub("", text).strip()
+
+
+def to_dt(ts):
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+    except (ValueError, AttributeError):
+        return None
+
+
+def short(path):
+    return "~" + path[len(HOME):] if path.startswith(HOME) else path
+
+
+def long_date(d, with_day=True):
+    s = f"{d.day} {MOIS[d.month - 1]}"
+    if d.year != date.today().year:
+        s += f" {d.year}"
+    return f"{JOURS[d.weekday()]} {s}" if with_day else s
+
+
+def day_label(d):
+    today = date.today()
+    if d == today:
+        return "Aujourd'hui"
+    if d == today - timedelta(days=1):
+        return "Hier"
+    return long_date(d).capitalize()
+
+
+def load_cache():
+    try:
+        for k, v in json.loads(CACHE_FILE.read_text()).items():
+            CACHE[k] = v
+    except (OSError, ValueError):
+        pass
+
+
+def save_cache(keep):
+    try:
+        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CACHE_FILE.write_text(json.dumps({k: CACHE[k] for k in keep}))
+    except OSError:
+        pass
+
+
+def summarize(path):
+    st = path.stat()
+    key = f"{path}|{st.st_mtime}|{st.st_size}"
+    if key in CACHE:
+        return key, CACHE[key]
+    title = first = cwd = last_ts = model = ""
+    n = 0
+    for o in iter_records(path):
+        t = o.get("type")
+        if t == "ai-title":
+            title = o.get("aiTitle") or title
+        elif t in ("user", "assistant") and not o.get("isSidechain"):
+            cwd = cwd or o.get("cwd") or ""
+            last_ts = o.get("timestamp") or last_ts
+            if t == "assistant":
+                model = (o.get("message") or {}).get("model") or model
+            elif not o.get("isMeta"):
+                txt = clean(plain(o))
+                if txt and not txt.startswith("<"):
+                    n += 1
+                    first = first or txt[:300]
+    dt = to_dt(last_ts)
+    info = {
+        "project": path.parent.name,
+        "id": path.stem,
+        "title": title or first[:80] or "(sans titre)",
+        "first": first,
+        "cwd": cwd or path.parent.name,
+        "n": n,
+        "ts": dt.timestamp() if dt else st.st_mtime,
+        "model": model,
+    }
+    CACHE[key] = info
+    return key, info
+
+
+def sessions():
+    before = len(CACHE)
+    pairs = [summarize(p) for p in ROOT.glob("*/*.jsonl")]
+    if len(CACHE) != before:
+        save_cache([k for k, _ in pairs])
+    out = [s for _, s in pairs if s["n"]]
+    out.sort(key=lambda s: s["ts"], reverse=True)
+    return out
+
+
+# ---------- rendu du texte ----------
+
+def inline(s):
+    s = esc(s)
+    codes = []
+
+    def stash(m):
+        codes.append(m.group(1))
+        return f"\x00{len(codes) - 1}\x00"
+
+    s = re.sub(r"`([^`\n]+)`", stash, s)
+    s = re.sub(r"\[([^\]\n]+)\]\((https?://[^\s)]+)\)", r'<a href="\2" target="_blank" rel="noopener">\1</a>', s)
+    s = re.sub(r"\*\*([^*\n]+)\*\*", r"<strong>\1</strong>", s)
+    s = re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"<em>\1</em>", s)
+    return re.sub(r"\x00(\d+)\x00", lambda m: f"<code>{codes[int(m.group(1))]}</code>", s)
+
+
+def cells(line):
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def prose(text):
+    out, para, lst = [], [], None
+    lines = text.split("\n")
+
+    def close():
+        nonlocal lst
+        if para:
+            out.append("<p>" + "<br>".join(inline(x) for x in para) + "</p>")
+            para.clear()
+        if lst:
+            out.append(f"</{lst}>")
+            lst = None
+
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        s = ln.strip()
+        m_h = re.match(r"(#{1,6})\s+(.*)", s)
+        m_li = re.match(r"(\s*)([-*+]|\d+[.)])\s+(.*)", ln)
+        if not s:
+            close()
+        elif m_h:
+            close()
+            lvl = min(len(m_h.group(1)) + 2, 5)
+            out.append(f"<h{lvl}>{inline(m_h.group(2))}</h{lvl}>")
+        elif re.fullmatch(r"(-{3,}|\*{3,}|_{3,})", s):
+            close()
+            out.append("<hr>")
+        elif s.startswith("|") and i + 1 < len(lines) and re.fullmatch(r"\|?[\s:|-]+\|?", lines[i + 1].strip()) and "-" in lines[i + 1]:
+            close()
+            out.append("<table><tr>" + "".join(f"<th>{inline(c)}</th>" for c in cells(s)) + "</tr>")
+            i += 2
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                out.append("<tr>" + "".join(f"<td>{inline(c)}</td>" for c in cells(lines[i])) + "</tr>")
+                i += 1
+            out.append("</table>")
+            continue
+        elif m_li:
+            kind = "ol" if m_li.group(2)[0].isdigit() else "ul"
+            if para or lst != kind:
+                close()
+                out.append(f"<{kind}>")
+                lst = kind
+            depth = min(len(m_li.group(1).replace("\t", "  ")) // 2, 2)
+            out.append(f"<li class=d{depth}>{inline(m_li.group(3))}</li>")
+        elif s.startswith(">"):
+            close()
+            out.append(f"<blockquote>{inline(s.lstrip('> '))}</blockquote>")
+        else:
+            if lst:
+                close()
+            para.append(s)
+        i += 1
+    close()
+    return "".join(out)
+
+
+def md(text):
+    parts = re.split(r"```([^\n]*)\n(.*?)(?:```|\Z)", text, flags=re.S)
+    out = []
+    for i in range(0, len(parts), 3):
+        out.append(prose(parts[i]))
+        if i + 2 < len(parts):
+            out.append(f"<pre><code>{esc(parts[i + 2].rstrip())}</code></pre>")
+    return "".join(out)
+
+
+def clip(s):
+    s = s if isinstance(s, str) else json.dumps(s, ensure_ascii=False, indent=2)
+    if len(s) > MAX_BLOCK:
+        s = s[:MAX_BLOCK] + f"\n[... tronqué, {len(s) - MAX_BLOCK} caractères de plus]"
+    return esc(s)
+
+
+def result_text(b):
+    c = b.get("content")
+    if isinstance(c, list):
+        return "\n".join(x.get("text", f"[{x.get('type')}]") for x in c if isinstance(x, dict))
+    return c if isinstance(c, str) else ""
+
+
+def tool_hint(inp):
+    if isinstance(inp, dict):
+        for k in ("description", "command", "file_path", "pattern", "query", "url", "skill", "prompt", "path"):
+            v = inp.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip().splitlines()[0][:140]
+    return ""
+
+
+# ---------- pages ----------
+
+def render_session(path):
+    _, info = summarize(path)
+    out, toc, pend, results = [], [], [], {}
+    state = {"label": True, "first": None}
+
+    def who_claude(ts):
+        if not state["label"]:
+            return ""
+        state["label"] = False
+        dt = to_dt(ts)
+        return f"<div class=who>Claude <span>{dt.strftime('%H:%M') if dt else ''}</span></div>"
+
+    def flush(ts=None):
+        if not pend:
+            return
+        names = Counter(p[1] for p in pend if p[0] == "tool")
+        total = sum(names.values())
+        if total:
+            top = ", ".join(f"{n} ×{c}" if c > 1 else n for n, c in names.most_common(4))
+            label = f"{total} action{'s' if total > 1 else ''} : {top}{', ...' if len(names) > 4 else ''}"
+        else:
+            label = "Réflexion"
+        steps = []
+        for kind, name, payload, tid in pend:
+            if kind == "think":
+                steps.append(f"<details class=step><summary><b>Réflexion</b></summary><pre>{clip(payload)}</pre></details>")
+                continue
+            res = results.get(tid)
+            body = f"<pre>{clip(payload)}</pre>"
+            if res:
+                body += f"<div class=rl>Résultat</div><pre>{clip(res)}</pre>"
+            steps.append(f"<details class=step><summary><b>{esc(name)}</b> {esc(tool_hint(payload))}</summary>{body}</details>")
+        out.append(f"<div class=say>{who_claude(ts)}<details class=act><summary>{esc(label)}</summary>{''.join(steps)}</details></div>")
+        pend.clear()
+
+    for o in iter_records(path):
+        t = o.get("type")
+        if o.get("isSidechain"):
+            continue
+        if t == "system" and o.get("subtype") == "compact_boundary":
+            flush()
+            out.append("<div class=cut>contexte compacté ici</div>")
+            continue
+        if t not in ("user", "assistant"):
+            continue
+        ts, uid = o.get("timestamp"), esc(o.get("uuid", ""))
+        state["first"] = state["first"] or ts
+        for b in blocks(o):
+            bt = b.get("type")
+            if bt == "tool_result":
+                results[b.get("tool_use_id")] = result_text(b)
+            elif bt == "thinking":
+                if b.get("thinking"):
+                    pend.append(("think", "", b["thinking"], None))
+            elif bt in ("tool_use", "server_tool_use"):
+                pend.append(("tool", b.get("name", "?"), b.get("input", {}), b.get("id")))
+            elif bt == "text" and t == "assistant":
+                if b.get("text", "").strip():
+                    flush(ts)
+                    out.append(f"<div class=say id='m-{uid}'>{who_claude(ts)}{md(b['text'])}</div>")
+                    uid += "-n"
+            elif bt == "text" and not o.get("isMeta"):
+                txt = clean(b.get("text", ""))
+                cmd = COMMAND.search(txt)
+                if cmd:
+                    flush()
+                    out.append(f"<div class='ask cmd'>{esc(cmd.group(1))} {esc((cmd.group(2) or '').strip())}</div>")
+                elif txt and not txt.startswith("<"):
+                    flush()
+                    state["label"] = True
+                    dt = to_dt(ts)
+                    stamp = dt.strftime("%H:%M") if dt else ""
+                    toc.append(f"<li><a href='#m-{uid}'><span>{esc(txt[:110])}</span></a></li>")
+                    out.append(f"<div class=ask id='m-{uid}'><div class=who>Toi <span>{stamp}</span></div><div class=t>{esc(txt)}</div></div>")
+                    uid += "-n"
+    flush()
+
+    start = to_dt(state["first"])
+    when = f"{long_date(start.date())}, {start.strftime('%H:%M')}" if start else ""
+    meta = " · ".join(x for x in (when, f"{info['n']} message{'s' if info['n'] > 1 else ''} de toi", info.get("model", "")) if x)
+    cmd = f"cd {info['cwd']} && claude --resume {info['id']}"
+    head = (
+        f"<div class=path>{esc(short(info['cwd']))}</div><h1>{esc(info['title'])}</h1>"
+        f"<div class=meta>{esc(meta)}</div>"
+        f"<div class=resume><code id=cmd>{esc(cmd)}</code><button class=btn id=cp>Copier la commande</button></div>"
+        "<div class=tools><button class=btn id=tg>Déplier les actions</button></div>"
+    )
+    side = (
+        "<a class=back href='/'>&larr; toutes les conversations</a>"
+        "<p class=cap>Tes messages</p><ul class=toc>" + "".join(toc) + "</ul>"
+    )
+    return shell(info["title"], side, f"<article class=read>{head}{''.join(out)}</article>", JS_READ)
+
+
+def render_index():
+    ss = sessions()
+    folders = {}
+    per_day = Counter()
+    groups = {}
+    for s in ss:
+        dt = datetime.fromtimestamp(s["ts"])
+        d = dt.date()
+        per_day[d] += 1
+        f = folders.setdefault(s["cwd"], [0, s["ts"]])
+        f[0] += 1
+        k = esc(f"{s['title']} {s['cwd']} {s['first']}".lower())
+        rf = "" if s["first"].startswith(s["title"]) else f"<span class=rf>{esc(s['first'][:200])}</span>"
+        groups.setdefault(d, []).append(
+            f"<a class=row href='/s/{s['project']}/{s['id']}' data-f=\"{esc(s['cwd'])}\" data-d='{d.isoformat()}' data-k=\"{k}\">"
+            f"<time>{dt.strftime('%H:%M')}</time>"
+            f"<span><b>{esc(s['title'])}</b>{rf}</span>"
+            f"<span class=rp>&lrm;{esc(short(s['cwd']))}</span>"
+            f"<span class=rn>{s['n']} msg</span></a>"
+        )
+
+    side = [BRAND, "<p class=cap>Dossiers</p>",
+            f"<button class=fold data-f=''><b>Tous les dossiers</b><s>{len(ss)}</s></button>"]
+    for cwd, (n, _) in sorted(folders.items(), key=lambda kv: -kv[1][1]):
+        sp = short(cwd)
+        name = sp.rstrip("/").rsplit("/", 1)[-1] or sp
+        side.append(
+            f"<button class=fold data-f=\"{esc(cwd)}\" title=\"{esc(sp)}\"><b>{esc(name)}</b><s>{n}</s>"
+            + ("" if name == sp else f"<small>&lrm;{esc(sp)}</small>") + "</button>"
+        )
+
+    ribbon = ""
+    if per_day:
+        first, today = min(per_day), date.today()
+        peak = max(per_day.values())
+        bars = []
+        d = first
+        while d <= today:
+            c = per_day.get(d, 0)
+            tip = f"{long_date(d)} : {c} conversation{'s' if c > 1 else ''}" if c else f"{long_date(d)} : rien"
+            bars.append(
+                f"<button class='bar{'' if c else ' none'}' data-d='{d.isoformat()}' title=\"{esc(tip)}\" aria-label=\"{esc(tip)}\""
+                f"{'' if c else ' disabled'} style='--h:{round(100 * c / peak)}%'><span></span></button>"
+            )
+            d += timedelta(days=1)
+        ribbon = (
+            f"<div class=ribbon><div class=bars>{''.join(bars)}</div>"
+            f"<div class=ends><span>{long_date(first, False)}</span><span class=lg>un trait par jour, clique pour isoler une journée</span><span>aujourd'hui</span></div></div>"
+        )
+
+    days = "".join(
+        f"<section class=day><h2>{day_label(d)}</h2>{''.join(rows)}</section>"
+        for d, rows in sorted(groups.items(), reverse=True)
+    )
+    main = (
+        "<form class=find action=/search><input id=q name=q autocomplete=off autofocus "
+        "placeholder='Filtrer par titre, dossier ou premier message'>"
+        "<button>Chercher<span class=lg> dans les messages</span></button></form>"
+        "<p class=hint><kbd>/</kbd> pour filtrer la liste, <kbd>Entrée</kbd> pour chercher dans tout le texte des conversations</p>"
+        + ribbon
+        + "<p class=count><span id=cnt></span><button class=reset id=reset hidden>tout réafficher</button></p>"
+        + days
+        + "<p class=empty id=empty hidden>Aucun titre ni dossier ne contient « <span id=term></span> ». "
+        "Appuie sur Entrée pour chercher ce mot dans le texte des messages.</p>"
+    )
+    return shell("Journal Claude Code", "".join(side), main, JS_INDEX)
+
+
+def render_search(q):
+    ql = q.lower().strip()
+    sets, total = [], 0
+    if len(ql) >= 2:
+        for s in sessions():
+            path = ROOT / s["project"] / (s["id"] + ".jsonl")
+            hits = []
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.startswith('{"type":"api-request') or ql not in line.lower():
+                        continue
+                    try:
+                        o = json.loads(line)
+                    except ValueError:
+                        continue
+                    if o.get("type") not in ("user", "assistant") or o.get("isSidechain") or o.get("isMeta"):
+                        continue
+                    txt = plain(o) if o["type"] == "assistant" else clean(plain(o))
+                    i = txt.lower().find(ql)
+                    if i < 0:
+                        continue
+                    a, b = max(0, i - 80), i + len(ql) + 160
+                    snip = (
+                        ("... " if a else "") + esc(txt[a:i])
+                        + "<mark>" + esc(txt[i:i + len(ql)]) + "</mark>"
+                        + esc(txt[i + len(ql):b]) + (" ..." if b < len(txt) else "")
+                    )
+                    hits.append((esc(o.get("uuid", "")), o["type"] == "user", snip))
+            if hits:
+                total += len(hits)
+                url = f"/s/{s['project']}/{s['id']}"
+                when = long_date(datetime.fromtimestamp(s["ts"]).date(), False)
+                block = [f"<section class=hitset><h2><a href='{url}'>{esc(s['title'])}</a></h2>"
+                         f"<div class=path>{esc(short(s['cwd']))} · {when}</div>"]
+                for uid, mine, snip in hits[:5]:
+                    block.append(f"<a class=hit href='{url}#m-{uid}'><i class='{'u' if mine else ''}'>{'Toi' if mine else 'Claude'}</i><span>{snip}</span></a>")
+                if len(hits) > 5:
+                    block.append(f"<div class=more>et {len(hits) - 5} autres passages dans cette conversation</div>")
+                block.append("</section>")
+                sets.append("".join(block))
+    if len(ql) < 2:
+        status = "Tape au moins deux caractères."
+    elif not total:
+        status = f"Aucun message ne contient « {esc(q)} ». Essaie un mot plus court ou une autre orthographe."
+    else:
+        status = f"{total} passage{'s' if total > 1 else ''} dans {len(sets)} conversation{'s' if len(sets) > 1 else ''}"
+    main = (
+        f"<form class=find action=/search><input name=q value=\"{esc(q)}\" autocomplete=off autofocus>"
+        "<button>Chercher<span class=lg> dans les messages</span></button></form>"
+        f"<p class=count>{status}</p>" + "".join(sets)
+    )
+    side = BRAND + "<a class=back href='/'>&larr; toutes les conversations</a>"
+    return shell(f"Recherche : {q}", side, main)
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def send(self, body, code=200):
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        u = urllib.parse.urlparse(self.path)
+        try:
+            if u.path == "/":
+                return self.send(render_index())
+            if u.path == "/search":
+                q = urllib.parse.parse_qs(u.query).get("q", [""])[0]
+                return self.send(render_search(q))
+            parts = u.path.strip("/").split("/")
+            if len(parts) == 3 and parts[0] == "s" and SAFE.match(parts[1]) and SAFE.match(parts[2]):
+                path = ROOT / parts[1] / (parts[2] + ".jsonl")
+                if path.is_file():
+                    return self.send(render_session(path))
+            side = BRAND
+            main = "<p class=empty>Cette conversation n'existe plus sur le disque. <a href='/'>Revenir à la liste</a></p>"
+            self.send(shell("Introuvable", side, main), 404)
+        except BrokenPipeError:
+            pass
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    port = int(args[0]) if args else 8787
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError as e:
+        sys.exit(f"Port {port} indisponible ({e}). Essaie : claude-history {port + 1}")
+    load_cache()
+    url = f"http://127.0.0.1:{port}/"
+    print(f"claude-history sur {url} (Ctrl+C pour arrêter)")
+    if "--no-open" not in sys.argv:
+        webbrowser.open(url)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print()
+
+
+if __name__ == "__main__":
+    main()
