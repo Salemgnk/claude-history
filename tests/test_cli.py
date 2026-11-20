@@ -219,6 +219,26 @@ class TestFind(Case):
         self.assertEqual(self.ids("nouveaute"), ["bbb"])
         self.assertIn(str(self.root / "proj-b" / "bbb.jsonl"), json.loads(mod.text_file().read_text()))
 
+    def test_caches_are_private(self):
+        mod.refresh_index()
+        for f in (mod.text_file(), mod.CACHE_FILE):
+            self.assertEqual(f.stat().st_mode & 0o077, 0, f)
+
+    def test_home_path_does_not_match_every_folder(self):
+        with mock.patch.object(mod, "HOME", self.tmp):
+            mod.refresh_index()
+            self.assertEqual(self.ids(Path(self.tmp).name), [""])
+            self.assertEqual(self.ids("maison"), ["aaa"])
+
+    def test_index_from_older_version_is_rebuilt(self):
+        idx = mod.refresh_index()
+        for e in idx.values():
+            e.pop("v", None)
+            e["f"] = e["o"] = "vieux"
+        mod.text_file().write_text(json.dumps(idx))
+        mod.refresh_index()
+        self.assertEqual(self.ids("forward"), ["aaa"])
+
     def test_index_survives_corrupt_file(self):
         mod.text_file().parent.mkdir(parents=True, exist_ok=True)
         mod.text_file().write_text("{pas du json")
