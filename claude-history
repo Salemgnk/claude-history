@@ -4,15 +4,19 @@
 Usage :
   claude-history                         sélecteur interactif (fzf)
   claude-history list                    liste des conversations
-  claude-history search <mots>           conversations dont les messages contiennent <mots>
+  claude-history search <mots>           conversations qui contiennent tous ces <mots>
   claude-history show <projet> <id>      lire une conversation
   claude-history web [port] [--no-open]  interface navigateur sur 127.0.0.1
 
-Dans le sélecteur : Entrée reprend la conversation dans son dossier d'origine,
-Ctrl-F bascule sur la recherche dans le texte des messages, Ctrl-O lit la
-conversation entière, Échap quitte.
+Dans le sélecteur, tape des mots dans n'importe quel ordre : ils sont cherchés
+dans le titre, le dossier et le texte des messages, sans tenir compte des
+majuscules ni des accents, et un début de mot suffit. Les conversations dont le
+titre ou le dossier correspond viennent en premier.
+Entrée reprend la conversation dans son dossier d'origine, Ctrl-O la lit en
+entier, Échap quitte.
 
-Lit ~/.claude/projects en lecture seule.
+Lit ~/.claude/projects en lecture seule. Index de recherche dans
+~/.cache/claude-history/text.json, mis à jour à chaque lancement.
 """
 import html
 import json
@@ -22,6 +26,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import unicodedata
 import urllib.parse
 import webbrowser
 from collections import Counter
@@ -318,11 +323,7 @@ def load_cache():
 
 
 def save_cache(keep):
-    try:
-        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        CACHE_FILE.write_text(json.dumps({k: CACHE[k] for k in keep}))
-    except OSError:
-        pass
+    atomic_write(CACHE_FILE, json.dumps({k: CACHE[k] for k in keep}))
 
 
 def summarize(path):
@@ -859,30 +860,205 @@ def _write_text(path, w):
     flush()
 
 
-def search_lines(q):
-    ql = q.lower().strip()
-    if len(ql) < 2:
+# ---------- index plein texte du terminal ----------
+#
+# Pour chaque conversation : une ligne d'en-tête (titre, dossier, premier message)
+# puis une ligne par message visible. "o" garde le texte d'origine, "f" le même
+# texte replié (minuscules, sans accents) caractère pour caractère, donc les
+# positions trouvées dans "f" valent dans "o". "r" donne le rôle de chaque ligne.
+
+CTRL1 = re.compile(r"[\x00-\x1f\x7f]")
+PASSAGES_MAX = 30
+
+
+class _Fold(dict):
+    def __missing__(self, code):
+        c = chr(code)
+        base = "".join(x for x in unicodedata.normalize("NFKD", c) if not unicodedata.combining(x))
+        r = (base[:1] or c).lower()[:1] or c
+        self[code] = r
+        return r
+
+
+FOLD = _Fold()
+
+
+def fold(s):
+    """Minuscules et sans accents, sans changer la longueur du texte."""
+    return s.lower() if s.isascii() else s.translate(FOLD)
+
+
+def text_file():
+    return CACHE_FILE.with_name("text.json")
+
+
+def atomic_write(path, data):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(data, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def build_entry(path, key, info):
+    roles, lines = ["h"], [f"{info['title']} · {info['cwd']} · {info['first']}"]
+    for o in iter_records(path):
+        t = o.get("type")
+        if t not in ("user", "assistant") or o.get("isSidechain") or o.get("isMeta"):
+            continue
+        for b in blocks(o):
+            if b.get("type") != "text":
+                continue
+            txt = b.get("text", "") if t == "assistant" else clean(b.get("text", ""))
+            if not txt.strip() or (t == "user" and (txt.startswith("<") or COMMAND.search(txt))):
+                continue
+            roles.append("u" if t == "user" else "a")
+            lines.append(txt.strip())
+    orig = "\n".join(CTRL1.sub(" ", x) for x in lines)
+    return {"k": key, "r": "".join(roles), "o": orig, "f": fold(orig)}
+
+
+def load_text_index():
+    try:
+        idx = json.loads(text_file().read_text(encoding="utf-8"))
+        return idx if isinstance(idx, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def refresh_index(write=True, notice=False):
+    """{chemin: entrée} pour toutes les conversations listées.
+
+    write=True reconstruit ce qui a changé et enregistre l'index. write=False
+    (rechargements de fzf, qui peuvent tourner en parallèle) n'écrit rien et
+    garde une entrée périmée plutôt que de relire un gros fichier à chaque lettre.
+    """
+    old = load_text_index()
+    out, todo = {}, []
+    for s in sessions():
+        path = ROOT / s["project"] / (s["id"] + ".jsonl")
+        key, info = summarize(path)
+        e = old.get(str(path))
+        if not isinstance(e, dict) or "f" not in e or "o" not in e or (write and e.get("k") != key):
+            todo.append((path, key, info))
+        else:
+            out[str(path)] = e
+    if notice and len(todo) > 3:
+        err(f"Indexation de {len(todo)} conversations, ça ne se fait qu'une fois...")
+    for path, key, info in todo:
+        out[str(path)] = build_entry(path, key, info)
+    changed = bool(todo)
+    if write and (changed or len(out) != len(old)):
+        atomic_write(text_file(), json.dumps(out, ensure_ascii=False))
+    return out
+
+
+def query_terms(q):
+    return fold(q).split()
+
+
+def term_patterns(terms):
+    """Un mot cherché doit commencer un mot du texte : « ui » trouve « ui/ux » mais pas « suis »."""
+    return [re.compile(("(?<![a-z0-9])" if t[0].isalnum() else "") + re.escape(t)) for t in terms]
+
+
+def line_hits(lines, pats):
+    """Messages qui contiennent tous les mots, ou à défaut au moins un."""
+    every = [i for i in range(1, len(lines)) if all(p.search(lines[i]) for p in pats)]
+    return every or [i for i in range(1, len(lines)) if any(p.search(lines[i]) for p in pats)]
+
+
+def first_pos(folded, pats):
+    pos = [m.start() for m in (p.search(folded) for p in pats) if m]
+    return min(pos) if pos else 0
+
+
+def find(q, idx=None):
+    """[(session, entrée, numéros des lignes trouvées)] : titre ou dossier d'abord, puis par date."""
+    terms = query_terms(q)
+    if not terms:
+        return []
+    idx = refresh_index(write=False) if idx is None else idx
+    pats = term_patterns(terms)
+    first, rest = [], []
+    for s in sessions():
+        e = idx.get(str(ROOT / s["project"] / (s["id"] + ".jsonl")))
+        if not e or not all(t in e["f"] for t in terms) or not all(p.search(e["f"]) for p in pats):
+            continue
+        lines = e["f"].split("\n")
+        hits = line_hits(lines, pats)
+        (first if all(p.search(lines[0]) for p in pats) else rest).append((s, e, hits))
+    return first + rest
+
+
+def excerpt(orig, folded, pats):
+    """Extrait autour du premier mot trouvé, chaque mot cherché en vidéo inverse."""
+    i = first_pos(folded, pats)
+    a, b = max(0, i - 80), min(len(orig), i + 200)
+    o = orig[a:b]
+    marks = [False] * len(o)
+    for p in pats:
+        for m in p.finditer(folded, a, b):
+            for k in range(m.start() - a, min(m.end() - a, len(o))):
+                marks[k] = True
+    out, on = [], False
+    for c, m in zip(o, marks):
+        if m != on:
+            out.append(REV if m else RST)
+            on = m
+        out.append(c)
+    if on:
+        out.append(RST)
+    return ("... " if a else "") + "".join(out) + (" ..." if b < len(orig) else "")
+
+
+def plain_excerpt(orig, folded, pats):
+    a = max(0, first_pos(folded, pats) - 40)
+    return ("... " if a else "") + orig[a:a + 200]
+
+
+def search_lines(q, idx=None):
+    terms = query_terms(q)
+    if not terms:
         yield from list_lines()
         return
-    for s, hits in search_hits(q):
+    found = find(q, idx)
+    if not found:
+        yield f"\t\t{DIM}Aucune conversation ne contient « {one_line(q.strip())} ». Essaie moins de mots ou un mot plus court.{RST}"
+        return
+    for s, e, hits in found:
+        if not hits:
+            tail = "" if s["first"].startswith(s["title"]) else s["first"][:200]
+            yield list_line(s, f"{s['n']} msg", tail)
+            continue
         k = len(hits)
-        _, _, txt, i = hits[0]
-        yield list_line(s, f"{k} passage{'s' if k > 1 else ''}", "".join(snippet(txt, i, len(ql))))
+        i = hits[0]
+        tail = plain_excerpt(e["o"].split("\n")[i], e["f"].split("\n")[i], term_patterns(terms))
+        yield list_line(s, f"{k} passage{'s' if k > 1 else ''}", tail)
 
 
 def write_hits(path, q, out):
-    ql = q.lower().strip()
+    """Aperçu d'une conversation pour une recherche : ses passages, ou tout le texte si seul le titre correspond."""
+    terms = query_terms(q)
     w = out.write
     try:
-        _, info = summarize(path)
+        key, info = summarize(path)
+        e = refresh_index(write=False).get(str(path)) or build_entry(path, key, info)
+        o, f = e["o"].split("\n"), e["f"].split("\n")
+        pats = term_patterns(terms)
+        hits = line_hits(f, pats) if terms else []
+        if not hits:
+            _write_text(path, w)
+            return
         write_head(info, w)
-        hits = file_hits(path, ql, raw_needle(ql))
         k = len(hits)
-        w(f"{DIM}{k} passage{'s' if k > 1 else ''} pour « {one_line(q)} »{RST}\n")
-        for _, mine, txt, i in hits:
-            pre, mid, post = snippet(txt, i, len(ql))
-            who = f"{CYAN}Toi" if mine else "Claude"
-            w(f"\n{BOLD}{who}{RST}\n{pre}{REV}{mid}{RST}{post}\n")
+        w(f"{DIM}{k} passage{'s' if k > 1 else ''} pour « {one_line(q.strip())} »"
+          f"{f', les {PASSAGES_MAX} premiers' if k > PASSAGES_MAX else ''} · Ctrl-O pour tout lire{RST}\n")
+        for i in hits[:PASSAGES_MAX]:
+            who = f"{CYAN}Toi" if e["r"][i] == "u" else "Claude"
+            w(f"\n{BOLD}{who}{RST}\n{excerpt(o[i], f[i], pats)}\n")
     except BrokenPipeError:
         pass
 
@@ -936,8 +1112,9 @@ def serve(port, open_browser):
 
 # ---------- commandes ----------
 
-PROMPT_TITLE, PROMPT_TEXT = "titre> ", "texte> "
-HEADER = "Entrée reprendre · Ctrl-F chercher dans les messages · Ctrl-O lire · Échap quitter"
+PROMPT = "chercher> "
+HEADER = ("Tape des mots, dans n'importe quel ordre : titre, dossier ou contenu des messages\n"
+          "Entrée reprendre · Ctrl-O lire en entier · Échap quitter")
 
 
 def err(msg):
@@ -969,20 +1146,13 @@ def resume(info):
     return 0
 
 
-def toggle_action(prompt, me):
-    if prompt.startswith("texte"):
-        return f"change-prompt({PROMPT_TITLE})+enable-search+unbind(change)+reload({me} list)"
-    return f"change-prompt({PROMPT_TEXT})+disable-search+rebind(change)+reload({me} search {{q}})"
-
-
 def fzf_args(me):
+    # --disabled : fzf ne filtre pas lui-même, chaque frappe relance « query » qui cherche partout.
     return [
-        "--ansi", "--delimiter=\t", "--with-nth=3..", "--layout=reverse", "--tiebreak=index",
-        f"--prompt={PROMPT_TITLE}", f"--header={HEADER}",
+        "--ansi", "--disabled", "--delimiter=\t", "--with-nth=3..", "--layout=reverse",
+        f"--prompt={PROMPT}", f"--header={HEADER}",
         f"--preview={me} preview {{1}} {{2}} {{q}}", "--preview-window=right,55%,wrap",
-        "--bind=start:unbind(change)",
-        f"--bind=change:reload:{me} search {{q}}",
-        f"--bind=ctrl-f:transform:{me} toggle",
+        f"--bind=change:reload:{me} query {{q}}",
         f"--bind=ctrl-o:execute:{me} show {{1}} {{2}}",
     ]
 
@@ -1005,6 +1175,7 @@ def pick():
     if not fzf:
         err("fzf est introuvable. Installe-le, ou lance : claude-history web")
         return 1
+    refresh_index(write=True, notice=True)
     try:
         r = subprocess.run([fzf, *fzf_args(self_cmd())], input="\n".join(lines) + "\n",
                            stdout=subprocess.PIPE, text=True, encoding="utf-8")
@@ -1015,7 +1186,7 @@ def pick():
     if r.returncode:
         return r.returncode
     parts = r.stdout.rstrip("\n").split("\t")
-    if len(parts) < 2:
+    if len(parts) < 2 or not parts[0]:  # rien choisi, ou la ligne « Aucune conversation »
         return 0
     path = session_path(parts[0], parts[1])
     return resume(summarize(path)[1]) if path else 1
@@ -1081,19 +1252,21 @@ def main(argv=None):
         emit(list_lines())
         return 0
     if cmd == "search":
+        emit(search_lines(" ".join(argv[1:]), refresh_index(write=True)))
+        return 0
+    if cmd == "query":  # appelé par fzf à chaque frappe : n'écrit jamais l'index
         emit(search_lines(" ".join(argv[1:])))
         return 0
-    if cmd == "toggle":
-        print(toggle_action(os.environ.get("FZF_PROMPT", ""), self_cmd()))
-        return 0
     if cmd in ("preview", "show") and len(argv) >= 3:
+        if not argv[1] and not argv[2]:  # ligne « Aucune conversation »
+            return 0
         path = session_path(argv[1], argv[2])
         if not path:
             return 1
         q = argv[3] if len(argv) > 3 else ""
         if cmd == "show":
             show(path)
-        elif os.environ.get("FZF_PROMPT", "").startswith("texte") and len(q.strip()) >= 2:
+        elif query_terms(q):
             write_hits(path, q, sys.stdout)
         else:
             write_text(path, sys.stdout)

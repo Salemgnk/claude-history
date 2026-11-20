@@ -56,6 +56,7 @@ class Case(unittest.TestCase):
             ], cwd_a),
             rec("user", ta, "u2", [{"type": "tool_result", "tool_use_id": "t1", "content": "sortie cachée"}], cwd_a),
             rec("assistant", ta, "a2", [{"type": "text", "text": "Ta règle forward bloque le réseau."}], cwd_a),
+            rec("assistant", ta, "a5", [{"type": "text", "text": "Bonjour encore, on brainstorme l'ui/ux."}], cwd_a),
             rec("user", ta, "u3", "wireguard meta", cwd_a, isMeta=True),
             rec("assistant", ta, "a3", [{"type": "text", "text": "wireguard sidechain"}], cwd_a, isSidechain=True),
         ])
@@ -147,6 +148,83 @@ class TestSearch(Case):
         self.assertIn("\033[7mforward\033[0m", buf.getvalue())
 
 
+class TestFind(Case):
+    def ids(self, q):
+        return [l.split("\t")[1] for l in mod.search_lines(q)]
+
+    def test_fold_keeps_length(self):
+        for s in ("RÉSEAU", "Œuvre ﬁnale İstanbul", "ça déjà vu", "plain ascii"):
+            self.assertEqual(len(mod.fold(s)), len(s))
+        self.assertEqual(mod.fold("RÉSEAU déjà"), "reseau deja")
+
+    def test_words_in_any_order(self):
+        self.assertEqual(self.ids("bloque forward"), ["aaa"])
+        self.assertEqual(self.ids("forward   bloque"), ["aaa"])
+        self.assertEqual(self.ids("forward bonjour-inexistant"), [""])
+
+    def test_accents_both_ways(self):
+        self.assertEqual(sorted(self.ids("reseau")), ["aaa", "bbb"])
+        self.assertEqual(sorted(self.ids("RÉSEAU")), ["aaa", "bbb"])
+        self.assertEqual(self.ids("REGLE"), ["aaa"])
+
+    def test_prefix_and_partial_words(self):
+        self.assertEqual(self.ids("brainstorm ui"), ["aaa"])
+        self.assertEqual(self.ids("wiregu"), ["aaa"])
+
+    def test_matches_start_of_words_only(self):
+        self.assertEqual(self.ids("ward"), [""])          # pas le milieu de « forward »
+        self.assertEqual(self.ids("ux"), ["aaa"])         # « ui/ux » : après une barre oblique
+        self.assertEqual(self.ids("feu"), ["aaa"])        # « pare-feu » : après un tiret
+
+    def test_passages_prefer_lines_with_every_word(self):
+        idx = mod.refresh_index(write=False)
+        e = idx[str(self.root / "proj-a" / "aaa.jsonl")]
+        e["o"] += "\nforward seul"
+        e["f"] += "\nforward seul"
+        e["r"] += "a"
+        self.assertIn("1 passage", next(mod.search_lines("forward bloque", idx)))  # la ligne qui a les deux
+        self.assertIn("2 passages", next(mod.search_lines("forward", idx)))
+        self.assertIn("2 passages", next(mod.search_lines("bonjour bloque", idx)))  # aucune ligne n'a les deux
+
+    def test_title_or_folder_ranked_first(self):
+        # bbb (plus ancienne) a « bonjour » dans son titre, aaa (plus récente) seulement dans un message
+        self.assertEqual(self.ids("bonjour"), ["bbb", "aaa"])
+        self.assertEqual(self.ids("maison"), ["aaa"])  # nom du dossier
+
+    def test_hidden_text_not_searched(self):
+        for q in ("secret", "cachée", "sidechain", "meta"):
+            self.assertEqual(self.ids(q), [""], q)
+
+    def test_counts_and_tail(self):
+        line = next(mod.search_lines("forward"))
+        self.assertIn("1 passage", line)
+        self.assertIn("Ta règle forward bloque", line)
+
+    def test_empty_query_lists_all(self):
+        self.assertEqual(list(mod.search_lines("")), list(mod.list_lines()))
+        self.assertEqual(list(mod.search_lines("   ")), list(mod.list_lines()))
+
+    def test_no_result_placeholder(self):
+        (line,) = list(mod.search_lines("zzzz"))
+        self.assertTrue(line.startswith("\t\t"))
+        self.assertIn("Aucune conversation ne contient « zzzz »", line)
+
+    def test_index_refreshes_when_file_changes(self):
+        mod.refresh_index()
+        self.assertEqual(self.ids("nouveauté"), [""])
+        with open(self.root / "proj-b" / "bbb.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec("assistant", "2026-11-11T09:00:00Z", "a9",
+                                   [{"type": "text", "text": "une nouveauté ici"}], "/chemin/disparu")) + "\n")
+        mod.refresh_index()
+        self.assertEqual(self.ids("nouveaute"), ["bbb"])
+        self.assertIn(str(self.root / "proj-b" / "bbb.jsonl"), json.loads(mod.text_file().read_text()))
+
+    def test_index_survives_corrupt_file(self):
+        mod.text_file().parent.mkdir(parents=True, exist_ok=True)
+        mod.text_file().write_text("{pas du json")
+        self.assertEqual(self.ids("forward"), ["aaa"])
+
+
 class TestCli(Case):
     def run_main(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -168,13 +246,35 @@ class TestCli(Case):
         self.assertEqual(code, 1)
         self.assertIn("Aucune conversation", err)
 
-    def test_preview_modes(self):
-        with mock.patch.dict(os.environ, {"FZF_PROMPT": "titre> "}):
-            self.assertIn("1 action : Bash", self.run_main("preview", "proj-a", "aaa", "forward")[1])
-        with mock.patch.dict(os.environ, {"FZF_PROMPT": "texte> "}):
-            out = self.run_main("preview", "proj-a", "aaa", "forward")[1]
-        self.assertIn("\033[7mforward", out)
+    def test_preview_with_and_without_query(self):
+        self.assertIn("1 action : Bash", self.run_main("preview", "proj-a", "aaa")[1])
+        self.assertIn("1 action : Bash", self.run_main("preview", "proj-a", "aaa", " ")[1])
+        out = self.run_main("preview", "proj-a", "aaa", "FORWARD bloque")[1]
+        self.assertIn("1 passage", out)
+        self.assertIn("\033[7mforward\033[0m \033[7mbloque\033[0m", out)
         self.assertNotIn("1 action", out)
+
+    def test_preview_title_only_match_shows_conversation(self):
+        out = self.run_main("preview", "proj-a", "aaa", "pare-feu")[1]
+        self.assertIn("1 action : Bash", out)
+
+    def test_placeholder_is_silent(self):
+        self.assertEqual(self.run_main("preview", "", "", "zzzz"), (0, "", ""))
+        self.assertEqual(self.run_main("show", "", ""), (0, "", ""))
+        placeholder = list(mod.search_lines("zzzz"))[0]
+        done = mock.Mock(returncode=0, stdout=placeholder + "\n")
+        with mock.patch.object(mod.shutil, "which", return_value="/usr/bin/fzf"), \
+             mock.patch.object(mod.subprocess, "run", return_value=done), \
+             mock.patch.object(mod, "resume") as res:
+            self.assertEqual(self.run_main(), (0, "", ""))
+        res.assert_not_called()
+
+    def test_query_command_is_read_only(self):
+        code, out, _ = self.run_main("query", "forward")
+        self.assertEqual((code, out.split("\t")[1]), (0, "aaa"))
+        self.assertFalse(mod.text_file().exists())
+        self.run_main("search", "forward")
+        self.assertTrue(mod.text_file().exists())
 
     def test_show_rejects_bad_ids(self):
         self.assertEqual(self.run_main("show", "../etc", "passwd")[0], 1)
@@ -192,13 +292,11 @@ class TestCli(Case):
             mod.main(["web"])
         self.assertEqual(serve.call_args_list, [mock.call(8788, False), mock.call(8787, True)])
 
-    def test_toggle_action(self):
-        to_text = mod.toggle_action("titre> ", "ME")
-        self.assertIn("change-prompt(texte> )", to_text)
-        self.assertIn("reload(ME search {q})", to_text)
-        back = mod.toggle_action("texte> ", "ME")
-        self.assertIn("change-prompt(titre> )", back)
-        self.assertIn("reload(ME list)", back)
+    def test_fzf_args_single_mode(self):
+        args = mod.fzf_args("ME")
+        self.assertIn("--disabled", args)
+        self.assertIn("--bind=change:reload:ME query {q}", args)
+        self.assertFalse(any("ctrl-f" in a or "toggle" in a for a in args))
 
     def test_resume_command_quotes(self):
         info = {"cwd": "/tmp/vpn maison", "id": "aaa"}
