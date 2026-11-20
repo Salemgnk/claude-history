@@ -1,12 +1,26 @@
 #!/usr/bin/env python3
-"""claude-history : lecteur local de toutes les conversations Claude Code.
+"""claude-history : retrouver et reprendre une conversation Claude Code.
 
-Usage : claude-history [port] [--no-open]
-Lit ~/.claude/projects en lecture seule et sert une interface sur 127.0.0.1.
+Usage :
+  claude-history                         sélecteur interactif (fzf)
+  claude-history list                    liste des conversations
+  claude-history search <mots>           conversations dont les messages contiennent <mots>
+  claude-history show <projet> <id>      lire une conversation
+  claude-history web [port] [--no-open]  interface navigateur sur 127.0.0.1
+
+Dans le sélecteur : Entrée reprend la conversation dans son dossier d'origine,
+Ctrl-F bascule sur la recherche dans le texte des messages, Ctrl-O lit la
+conversation entière, Échap quitte.
+
+Lit ~/.claude/projects en lecture seule.
 """
 import html
 import json
+import os
 import re
+import shlex
+import shutil
+import subprocess
 import sys
 import urllib.parse
 import webbrowser
@@ -357,6 +371,76 @@ def sessions():
     return out
 
 
+# ---------- recherche dans les messages ----------
+
+def raw_needle(ql):
+    """Le motif tel qu'il apparaît dans une ligne JSON brute (guillemets échappés, etc.)."""
+    return json.dumps(ql, ensure_ascii=False)[1:-1]
+
+
+def candidates(needle):
+    """Fichiers pouvant contenir le motif selon rg, ou None s'il faut tous les lire."""
+    rg = shutil.which("rg")
+    if not rg:
+        return None
+    try:
+        r = subprocess.run(
+            [rg, "-l", "-i", "-F", "-uu", "--glob", "*.jsonl", "--max-depth", "2", "-e", needle, str(ROOT)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return set(r.stdout.splitlines()) if r.returncode in (0, 1) else None
+
+
+def file_hits(path, ql, needle):
+    hits = []
+    try:
+        f = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return hits
+    with f:
+        for line in f:
+            if line.startswith('{"type":"api-request') or needle not in line.lower():
+                continue
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(o, dict):
+                continue
+            if o.get("type") not in ("user", "assistant") or o.get("isSidechain") or o.get("isMeta"):
+                continue
+            txt = plain(o) if o["type"] == "assistant" else clean(plain(o))
+            i = txt.lower().find(ql)
+            if i >= 0:
+                hits.append((o.get("uuid", ""), o["type"] == "user", txt, i))
+    return hits
+
+
+def search_hits(q):
+    """[(session, [(uuid, est_utilisateur, texte, position), ...]), ...] dans l'ordre de sessions()."""
+    ql = q.lower().strip()
+    if len(ql) < 2:
+        return []
+    needle = raw_needle(ql)
+    keep = candidates(needle)
+    found = []
+    for s in sessions():
+        path = ROOT / s["project"] / (s["id"] + ".jsonl")
+        if keep is not None and str(path) not in keep:
+            continue
+        hits = file_hits(path, ql, needle)
+        if hits:
+            found.append((s, hits))
+    return found
+
+
+def snippet(txt, i, n):
+    a, b = max(0, i - 80), i + n + 160
+    return ("... " if a else "") + txt[a:i], txt[i:i + n], txt[i + n:b] + (" ..." if b < len(txt) else "")
+
+
 # ---------- rendu du texte ----------
 
 def inline(s):
@@ -486,12 +570,7 @@ def render_session(path):
         if not pend:
             return
         names = Counter(p[1] for p in pend if p[0] == "tool")
-        total = sum(names.values())
-        if total:
-            top = ", ".join(f"{n} ×{c}" if c > 1 else n for n, c in names.most_common(4))
-            label = f"{total} action{'s' if total > 1 else ''} : {top}{', ...' if len(names) > 4 else ''}"
-        else:
-            label = "Réflexion"
+        label = actions_label(names) if names else "Réflexion"
         steps = []
         for kind, name, payload, tid in pend:
             if kind == "think":
@@ -635,43 +714,20 @@ def render_index():
 def render_search(q):
     ql = q.lower().strip()
     sets, total = [], 0
-    if len(ql) >= 2:
-        for s in sessions():
-            path = ROOT / s["project"] / (s["id"] + ".jsonl")
-            hits = []
-            with open(path, encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    if line.startswith('{"type":"api-request') or ql not in line.lower():
-                        continue
-                    try:
-                        o = json.loads(line)
-                    except ValueError:
-                        continue
-                    if o.get("type") not in ("user", "assistant") or o.get("isSidechain") or o.get("isMeta"):
-                        continue
-                    txt = plain(o) if o["type"] == "assistant" else clean(plain(o))
-                    i = txt.lower().find(ql)
-                    if i < 0:
-                        continue
-                    a, b = max(0, i - 80), i + len(ql) + 160
-                    snip = (
-                        ("... " if a else "") + esc(txt[a:i])
-                        + "<mark>" + esc(txt[i:i + len(ql)]) + "</mark>"
-                        + esc(txt[i + len(ql):b]) + (" ..." if b < len(txt) else "")
-                    )
-                    hits.append((esc(o.get("uuid", "")), o["type"] == "user", snip))
-            if hits:
-                total += len(hits)
-                url = f"/s/{s['project']}/{s['id']}"
-                when = long_date(datetime.fromtimestamp(s["ts"]).date(), False)
-                block = [f"<section class=hitset><h2><a href='{url}'>{esc(s['title'])}</a></h2>"
-                         f"<div class=path>{esc(short(s['cwd']))} · {when}</div>"]
-                for uid, mine, snip in hits[:5]:
-                    block.append(f"<a class=hit href='{url}#m-{uid}'><i class='{'u' if mine else ''}'>{'Toi' if mine else 'Claude'}</i><span>{snip}</span></a>")
-                if len(hits) > 5:
-                    block.append(f"<div class=more>et {len(hits) - 5} autres passages dans cette conversation</div>")
-                block.append("</section>")
-                sets.append("".join(block))
+    for s, hits in search_hits(q):
+        total += len(hits)
+        url = f"/s/{s['project']}/{s['id']}"
+        when = long_date(datetime.fromtimestamp(s["ts"]).date(), False)
+        block = [f"<section class=hitset><h2><a href='{url}'>{esc(s['title'])}</a></h2>"
+                 f"<div class=path>{esc(short(s['cwd']))} · {when}</div>"]
+        for uid, mine, txt, i in hits[:5]:
+            pre, mid, post = snippet(txt, i, len(ql))
+            snip = esc(pre) + "<mark>" + esc(mid) + "</mark>" + esc(post)
+            block.append(f"<a class=hit href='{url}#m-{esc(uid)}'><i class='{'u' if mine else ''}'>{'Toi' if mine else 'Claude'}</i><span>{snip}</span></a>")
+        if len(hits) > 5:
+            block.append(f"<div class=more>et {len(hits) - 5} autres passages dans cette conversation</div>")
+        block.append("</section>")
+        sets.append("".join(block))
     if len(ql) < 2:
         status = "Tape au moins deux caractères."
     elif not total:
@@ -685,6 +741,150 @@ def render_search(q):
     )
     side = BRAND + "<a class=back href='/'>&larr; toutes les conversations</a>"
     return shell(f"Recherche : {q}", side, main)
+
+
+# ---------- terminal ----------
+
+ABBR = ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."]
+DIM, BOLD, CYAN, REV, RST = "\033[2m", "\033[1m", "\033[36m", "\033[7m", "\033[0m"
+CTRL = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def actions_label(names):
+    total = sum(names.values())
+    top = ", ".join(f"{n} ×{c}" if c > 1 else n for n, c in names.most_common(4))
+    return f"{total} action{'s' if total > 1 else ''} : {top}{', ...' if len(names) > 4 else ''}"
+
+
+def one_line(s):
+    return " ".join(CTRL.sub(" ", s).split())
+
+
+def list_line(s, count, tail):
+    d = datetime.fromtimestamp(s["ts"]).date()
+    when = f"{d.day:2d} {ABBR[d.month - 1]}" + (f" {d.year}" if d.year != date.today().year else "")
+    show = (
+        f"{when:<8}  {BOLD}{one_line(s['title'])[:60]}{RST}  "
+        f"{CYAN}{one_line(short(s['cwd']))}{RST}  {DIM}{count}"
+    )
+    tail = one_line(tail)
+    if tail:
+        show += f" · {tail}"
+    return f"{s['project']}\t{s['id']}\t{show}{RST}"
+
+
+def list_lines():
+    for s in sessions():
+        tail = "" if s["first"].startswith(s["title"]) else s["first"][:200]
+        yield list_line(s, f"{s['n']} msg", tail)
+
+
+def hhmm(ts):
+    dt = to_dt(ts)
+    return dt.strftime("%H:%M") if dt else ""
+
+
+def write_head(info, w):
+    dt = datetime.fromtimestamp(info["ts"])
+    meta = " · ".join(x for x in (
+        f"{long_date(dt.date())}, {dt.strftime('%H:%M')}",
+        f"{info['n']} message{'s' if info['n'] > 1 else ''} de toi",
+        info.get("model", ""),
+    ) if x)
+    w(f"{CYAN}{one_line(short(info['cwd']))}{RST}\n{BOLD}{one_line(info['title'])}{RST}\n{DIM}{meta}{RST}\n")
+
+
+def write_text(path, out):
+    try:
+        _write_text(path, out.write)
+    except BrokenPipeError:
+        pass
+
+
+def _write_text(path, w):
+    _, info = summarize(path)
+    write_head(info, w)
+    pend = Counter()
+    state = {"label": True, "fresh": False, "ts": None}
+
+    def claude():
+        if state["label"]:
+            state["label"] = False
+            state["fresh"] = True
+            w(f"\n{BOLD}Claude {hhmm(state['ts'])}{RST}\n")
+
+    def flush():
+        if pend:
+            claude()
+            w(f"{DIM}  [{actions_label(pend)}]{RST}\n")
+            pend.clear()
+            state["fresh"] = True
+
+    for o in iter_records(path):
+        t = o.get("type")
+        if o.get("isSidechain"):
+            continue
+        if t == "system" and o.get("subtype") == "compact_boundary":
+            flush()
+            w(f"\n{DIM}--- contexte compacté ici ---{RST}\n")
+            continue
+        if t not in ("user", "assistant"):
+            continue
+        ts = o.get("timestamp")
+        for b in blocks(o):
+            bt = b.get("type")
+            if bt in ("tool_use", "server_tool_use"):
+                state["ts"] = state["ts"] if pend else ts
+                pend[b.get("name", "?")] += 1
+            elif bt == "text" and t == "assistant":
+                if b.get("text", "").strip():
+                    if not pend:
+                        state["ts"] = ts
+                    flush()
+                    claude()
+                    if not state["fresh"]:
+                        w("\n")
+                    state["fresh"] = False
+                    w(b["text"].strip() + "\n")
+            elif bt == "text" and not o.get("isMeta"):
+                txt = clean(b.get("text", ""))
+                cmd = COMMAND.search(txt)
+                if cmd:
+                    flush()
+                    w(f"\n{DIM}{cmd.group(1)} {(cmd.group(2) or '').strip()}{RST}\n")
+                elif txt and not txt.startswith("<"):
+                    flush()
+                    state["label"] = True
+                    w(f"\n{BOLD}{CYAN}Toi {hhmm(ts)}{RST}\n{txt}\n")
+    flush()
+
+
+def search_lines(q):
+    ql = q.lower().strip()
+    if len(ql) < 2:
+        yield from list_lines()
+        return
+    for s, hits in search_hits(q):
+        k = len(hits)
+        _, _, txt, i = hits[0]
+        yield list_line(s, f"{k} passage{'s' if k > 1 else ''}", "".join(snippet(txt, i, len(ql))))
+
+
+def write_hits(path, q, out):
+    ql = q.lower().strip()
+    w = out.write
+    try:
+        _, info = summarize(path)
+        write_head(info, w)
+        hits = file_hits(path, ql, raw_needle(ql))
+        k = len(hits)
+        w(f"{DIM}{k} passage{'s' if k > 1 else ''} pour « {one_line(q)} »{RST}\n")
+        for _, mine, txt, i in hits:
+            pre, mid, post = snippet(txt, i, len(ql))
+            who = f"{CYAN}Toi" if mine else "Claude"
+            w(f"\n{BOLD}{who}{RST}\n{pre}{REV}{mid}{RST}{post}\n")
+    except BrokenPipeError:
+        pass
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -718,17 +918,15 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
 
-def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("-")]
-    port = int(args[0]) if args else 8787
+def serve(port, open_browser):
     try:
         srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     except OSError as e:
-        sys.exit(f"Port {port} indisponible ({e}). Essaie : claude-history {port + 1}")
+        sys.exit(f"Port {port} indisponible ({e}). Essaie : claude-history web {port + 1}")
     load_cache()
     url = f"http://127.0.0.1:{port}/"
     print(f"claude-history sur {url} (Ctrl+C pour arrêter)")
-    if "--no-open" not in sys.argv:
+    if open_browser:
         webbrowser.open(url)
     try:
         srv.serve_forever()
@@ -736,5 +934,176 @@ def main():
         print()
 
 
+# ---------- commandes ----------
+
+PROMPT_TITLE, PROMPT_TEXT = "titre> ", "texte> "
+HEADER = "Entrée reprendre · Ctrl-F chercher dans les messages · Ctrl-O lire · Échap quitter"
+
+
+def err(msg):
+    print(msg, file=sys.stderr)
+
+
+def self_cmd():
+    return shlex.quote(sys.executable) + " " + shlex.quote(os.path.abspath(__file__))
+
+
+def resume_command(info):
+    return f"cd {shlex.quote(info['cwd'])} && claude --resume {info['id']}"
+
+
+def resume(info):
+    cwd, why = info["cwd"], ""
+    if not os.path.isdir(cwd):
+        why = f"Le dossier d'origine n'existe plus : {cwd}"
+    elif not shutil.which("claude"):
+        why = "La commande claude est introuvable dans le PATH."
+    if why:
+        err(why)
+        err("Commande de reprise :")
+        err(resume_command(info))
+        return 1
+    err(f"Reprise dans {short(cwd)}")
+    os.chdir(cwd)
+    os.execvp("claude", ["claude", "--resume", info["id"]])
+    return 0
+
+
+def toggle_action(prompt, me):
+    if prompt.startswith("texte"):
+        return f"change-prompt({PROMPT_TITLE})+enable-search+unbind(change)+reload({me} list)"
+    return f"change-prompt({PROMPT_TEXT})+disable-search+rebind(change)+reload({me} search {{q}})"
+
+
+def fzf_args(me):
+    return [
+        "--ansi", "--delimiter=\t", "--with-nth=3..", "--layout=reverse", "--tiebreak=index",
+        f"--prompt={PROMPT_TITLE}", f"--header={HEADER}",
+        f"--preview={me} preview {{1}} {{2}} {{q}}", "--preview-window=right,55%,wrap",
+        "--bind=start:unbind(change)",
+        f"--bind=change:reload:{me} search {{q}}",
+        f"--bind=ctrl-f:transform:{me} toggle",
+        f"--bind=ctrl-o:execute:{me} show {{1}} {{2}}",
+    ]
+
+
+def session_path(project, sid):
+    if SAFE.match(project) and SAFE.match(sid):
+        path = ROOT / project / (sid + ".jsonl")
+        if path.is_file():
+            return path
+    err("Cette conversation n'existe plus sur le disque.")
+    return None
+
+
+def pick():
+    lines = list(list_lines())
+    if not lines:
+        err("Aucune conversation dans ~/.claude/projects.")
+        return 1
+    fzf = shutil.which("fzf")
+    if not fzf:
+        err("fzf est introuvable. Installe-le, ou lance : claude-history web")
+        return 1
+    try:
+        r = subprocess.run([fzf, *fzf_args(self_cmd())], input="\n".join(lines) + "\n",
+                           stdout=subprocess.PIPE, text=True, encoding="utf-8")
+    except KeyboardInterrupt:
+        return 0
+    if r.returncode in (1, 130):
+        return 0
+    if r.returncode:
+        return r.returncode
+    parts = r.stdout.rstrip("\n").split("\t")
+    if len(parts) < 2:
+        return 0
+    path = session_path(parts[0], parts[1])
+    return resume(summarize(path)[1]) if path else 1
+
+
+def quiet_pipe():
+    """Le lecteur est parti (head, fzf) : éviter l'erreur à la fermeture de stdout."""
+    try:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def emit(lines):
+    try:
+        for line in lines:
+            sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        quiet_pipe()
+
+
+def show(path):
+    if sys.stdout.isatty() and shutil.which("less"):
+        p = subprocess.Popen(["less", "-R"], stdin=subprocess.PIPE, text=True, encoding="utf-8")
+        try:
+            write_text(path, p.stdin)
+            p.stdin.close()
+        except (BrokenPipeError, KeyboardInterrupt):
+            pass
+        while True:
+            try:
+                p.wait()
+                break
+            except KeyboardInterrupt:
+                continue
+    else:
+        write_text(path, sys.stdout)
+        try:
+            sys.stdout.flush()
+        except BrokenPipeError:
+            quiet_pipe()
+
+
+def usage(code):
+    print(__doc__.strip(), file=sys.stdout if code == 0 else sys.stderr)
+    return code
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    cmd = argv[0] if argv else ""
+    if cmd in ("-h", "--help", "help"):
+        return usage(0)
+    if cmd == "web" or cmd.isdigit():
+        ports = [a for a in argv if a.isdigit()]
+        serve(int(ports[0]) if ports else 8787, "--no-open" not in argv)
+        return 0
+    load_cache()
+    if not cmd:
+        return pick()
+    if cmd == "list":
+        emit(list_lines())
+        return 0
+    if cmd == "search":
+        emit(search_lines(" ".join(argv[1:])))
+        return 0
+    if cmd == "toggle":
+        print(toggle_action(os.environ.get("FZF_PROMPT", ""), self_cmd()))
+        return 0
+    if cmd in ("preview", "show") and len(argv) >= 3:
+        path = session_path(argv[1], argv[2])
+        if not path:
+            return 1
+        q = argv[3] if len(argv) > 3 else ""
+        if cmd == "show":
+            show(path)
+        elif os.environ.get("FZF_PROMPT", "").startswith("texte") and len(q.strip()) >= 2:
+            write_hits(path, q, sys.stdout)
+        else:
+            write_text(path, sys.stdout)
+        try:
+            sys.stdout.flush()
+        except BrokenPipeError:
+            quiet_pipe()
+        return 0
+    return usage(2)
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
