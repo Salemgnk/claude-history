@@ -432,6 +432,21 @@ class TestExtras(Case):
             self.assertIn(pm, sh)
         self.assertIn("fzf", sh)
 
+    def test_pyproject(self):
+        repo = Path(SCRIPT).resolve().parent
+        txt = (repo / "pyproject.toml").read_text()
+        self.assertIn('claude-history = "claude_history:main"', txt)
+        self.assertIn('py-modules = ["claude_history"]', txt)
+
+    def test_pkgbuild(self):
+        txt = (Path(SCRIPT).resolve().parent / "PKGBUILD").read_text()
+        self.assertIn("pkgname=claude-history", txt)
+        self.assertIn("/usr/bin/claude-history", txt)
+
+    def test_module_importable(self):
+        self.assertTrue(callable(mod.main))
+        self.assertEqual(Path(SCRIPT).resolve().name, "claude_history.py")
+
 
 if __name__ == "__main__":
     unittest.main()

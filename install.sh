@@ -10,7 +10,7 @@ say() { printf '  %s\n' "$*"; }
 
 # 1. Lien dans le PATH
 mkdir -p "$bin"
-ln -sf "$here/claude-history" "$bin/claude-history"
+ln -sf "$here/claude_history.py" "$bin/claude-history"
 say "claude-history -> $bin/claude-history"
 case ":$PATH:" in
   *":$bin:"*) ;;
@@ -50,6 +50,6 @@ fi
 
 # 4. Construire l'index une fois (silencieux)
 say "Construction de l'index de recherche..."
-"$here/claude-history" search "" >/dev/null 2>&1 || true
+"$here/claude_history.py" search "" >/dev/null 2>&1 || true
 
 say "Terminé. Lance : claude-history"

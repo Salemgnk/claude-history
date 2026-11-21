@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-history"
+version = "1.0.0"
+description = "Retrouver et reprendre une conversation Claude Code depuis le terminal"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "Salem" }]
+keywords = ["claude", "claude-code", "cli", "history", "fzf", "terminal"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/Salemgnk/claude-history"
+
+[project.scripts]
+claude-history = "claude_history:main"
+
+[tool.setuptools]
+py-modules = ["claude_history"]

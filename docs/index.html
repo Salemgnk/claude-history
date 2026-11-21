@@ -142,6 +142,11 @@ section{padding:60px 0}
 .step p{color:var(--mut);font-size:14.5px;margin:12px 0 0}
 @media(max-width:620px){.steps{grid-template-columns:1fr}}
 
+.pkgs{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;margin-top:18px;font-family:var(--mono);font-size:13.5px}
+.pkgs .lbl{color:var(--mut);font-family:var(--body);font-size:14px}
+.pkgs code{background:var(--code);color:var(--ink);padding:7px 12px;border-radius:9px}
+.pkgs code .c{color:var(--petrol)}
+.pkgs .sep{color:var(--mut);font-family:var(--body);font-size:13.5px;margin-right:6px}
 .note{display:flex;gap:14px;align-items:flex-start;margin-top:30px;background:var(--coral-tint);
   border:1px solid color-mix(in srgb,var(--coral) 30%,var(--line));border-radius:12px;padding:16px 18px}
 .note b{color:var(--coral)}
@@ -291,6 +296,13 @@ footer a:hover{text-decoration:underline}
         <pre><span class="c">./install.sh</span></pre>
         <p>Il pose le lien dans le PATH, construit l'index, et propose d'installer fzf s'il manque. Relancable sans risque.</p>
       </div>
+    </div>
+    <div class="pkgs">
+      <span class="lbl">ou en paquet</span>
+      <code><span class="c">pipx</span> install .</code>
+      <span class="sep">pour toute machine</span>
+      <code><span class="c">makepkg</span> -si</code>
+      <span class="sep">pour Arch (pacman)</span>
     </div>
     <div class="note">
       <span>&#128274;</span>

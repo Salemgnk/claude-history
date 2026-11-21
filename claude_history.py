@@ -1,0 +1,1414 @@
+#!/usr/bin/env python3
+"""claude-history : retrouver et reprendre une conversation Claude Code.
+
+Usage :
+  claude-history                         sélecteur interactif (fzf)
+  claude-history last                    reprendre la conversation la plus récente
+  claude-history list                    liste des conversations
+  claude-history search <mots>           conversations qui contiennent tous ces <mots>
+  claude-history show <projet> <id>      lire une conversation
+  claude-history export <projet> <id>    exporter une conversation en Markdown
+  claude-history stats                   aperçu de tes conversations
+  claude-history web [port] [--no-open]  interface navigateur sur 127.0.0.1
+
+Dans le sélecteur, tape des mots dans n'importe quel ordre : ils sont cherchés
+dans le titre, le dossier et le texte des messages, sans tenir compte des
+majuscules ni des accents, et un début de mot suffit. Les conversations dont le
+titre ou le dossier correspond viennent en premier.
+Entrée reprend la conversation dans son dossier d'origine, Ctrl-O la lit en
+entier, Échap quitte.
+
+Lit ~/.claude/projects en lecture seule. Index de recherche dans
+~/.cache/claude-history/text.json, mis à jour à chaque lancement.
+"""
+import html
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import unicodedata
+import urllib.parse
+import webbrowser
+from collections import Counter
+from datetime import date, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+HOME = str(Path.home())
+ROOT = Path.home() / ".claude" / "projects"
+CACHE_FILE = Path.home() / ".cache" / "claude-history" / "index.json"
+SAFE = re.compile(r"^[A-Za-z0-9._-]+$")
+REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+COMMAND = re.compile(r"<command-name>(.*?)</command-name>(?:.*?<command-args>(.*?)</command-args>)?", re.S)
+MAX_BLOCK = 20000
+JOURS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+MOIS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août",
+        "septembre", "octobre", "novembre", "décembre"]
+CACHE = {}
+
+FONTS = (
+    "<link rel=preconnect href=https://fonts.googleapis.com>"
+    "<link rel=preconnect href=https://fonts.gstatic.com crossorigin>"
+    "<link rel=stylesheet href='https://fonts.googleapis.com/css2?"
+    "family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700"
+    "&family=Hanken+Grotesk:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap'>"
+)
+
+CSS = """
+:root{
+  --paper:#edf1ef;--surface:#f9fbfa;--ink:#10272b;--mut:#587074;--line:#cdd8d5;
+  --petrol:#0e6b62;--coral:#cf4526;--coral-tint:#fbe8e1;--marker:#ffd84d;--code:#e2e9e7;
+  --display:"Bricolage Grotesque",system-ui,sans-serif;
+  --body:"Hanken Grotesk",system-ui,sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,"Cascadia Code",monospace;
+}
+@media(prefers-color-scheme:dark){:root{
+  --paper:#0d1618;--surface:#132124;--ink:#e2ecea;--mut:#88a09f;--line:#243639;
+  --petrol:#58c9b8;--coral:#ff8b6b;--coral-tint:#2b1c18;--code:#1a2b2e;
+}}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html{scroll-padding-top:24px}
+body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.6 var(--body);-webkit-font-smoothing:antialiased}
+a{color:var(--petrol)}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;text-align:left}
+:focus-visible{outline:2px solid var(--coral);outline-offset:2px;border-radius:4px}
+.app{display:grid;grid-template-columns:300px minmax(0,1fr);min-height:100vh}
+
+/* colonne de gauche */
+.side{border-right:1px solid var(--line);padding:28px 18px 40px 24px;position:sticky;top:0;height:100vh;overflow-y:auto}
+.brand{display:block;font:700 26px/1 var(--display);letter-spacing:-.03em;color:var(--ink);text-decoration:none}
+.brand i{font-style:normal;color:var(--coral)}
+.tag{font:12px var(--mono);color:var(--mut);margin:8px 0 28px}
+.cap{font:500 11px var(--mono);letter-spacing:.09em;text-transform:uppercase;color:var(--mut);margin:0 0 8px}
+.fold{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 10px;width:100%;padding:7px 10px;margin-left:-10px;border-radius:7px;align-items:baseline}
+.fold:hover{background:var(--surface)}
+.fold[aria-pressed=true]{background:var(--ink);color:var(--paper)}
+.fold b{font-weight:600;font-size:14.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fold s{text-decoration:none;font:12px var(--mono);opacity:.65}
+.fold small{grid-column:1/-1;font:11.5px var(--mono);opacity:.6;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:left}
+.toc{list-style:none;margin:0;padding:0;border-left:1px solid var(--line)}
+.toc a{display:block;padding:6px 0 6px 12px;margin-left:-1px;border-left:2px solid transparent;font-size:13.5px;line-height:1.35;color:var(--mut);text-decoration:none}
+.toc a span{overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow-wrap:anywhere}
+.toc a:hover{color:var(--ink)}
+.toc a.on{color:var(--ink);border-left-color:var(--coral)}
+.back{display:inline-block;font:13px var(--mono);margin-bottom:26px;text-decoration:none}
+.back:hover{text-decoration:underline}
+
+/* colonne principale */
+.main{padding:28px clamp(18px,4vw,56px) 96px;min-width:0}
+.find{display:flex;gap:10px;margin-bottom:22px}
+.find input{flex:1;min-width:0;padding:12px 16px;font:16px var(--body);color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:10px}
+.find input::placeholder{color:var(--mut)}
+.find button{padding:0 18px;border-radius:10px;background:var(--ink);color:var(--paper);font-weight:600;font-size:14.5px;white-space:nowrap}
+.find button:hover{background:var(--petrol)}
+.hint{font-size:13px;color:var(--mut);margin:-14px 0 22px}
+kbd{font:12px var(--mono);border:1px solid var(--line);border-radius:4px;padding:1px 5px;background:var(--surface)}
+
+/* ruban d'activité */
+.ribbon{margin:0 0 30px}
+.bars{display:flex;align-items:flex-end;gap:2px;height:64px;border-bottom:1px solid var(--line)}
+.bar{flex:1;min-width:2px;height:100%;display:flex;align-items:flex-end;padding:0}
+.bar span{display:block;width:100%;height:var(--h);min-height:2px;background:var(--petrol);border-radius:2px 2px 0 0;transition:background .12s}
+.bar.none span{background:var(--line);min-height:1px;height:1px}
+.bar:hover span{background:var(--ink)}
+.bar[aria-pressed=true] span{background:var(--coral)}
+.ends{display:flex;justify-content:space-between;font:11.5px var(--mono);color:var(--mut);margin-top:6px}
+
+/* liste */
+.count{font:13px var(--mono);color:var(--mut);margin:0 0 4px}
+.reset{font:13px var(--mono);color:var(--coral);text-decoration:underline;margin-left:10px}
+.day h2{font:700 21px/1.2 var(--display);letter-spacing:-.02em;margin:30px 0 8px}
+.row{display:grid;grid-template-columns:52px minmax(0,1fr) minmax(0,220px) 60px;gap:16px;align-items:baseline;padding:11px 12px;margin:0 -12px;color:inherit;text-decoration:none;border-top:1px solid var(--line)}
+.day .row:first-of-type{border-top-color:transparent}
+.row:hover{background:var(--surface)}
+.row:hover b{color:var(--petrol)}
+.row time,.row .rp,.row .rn{font:12.5px var(--mono);color:var(--mut)}
+.row b{display:block;font-weight:600;font-size:16px;line-height:1.35}
+.row .rf{display:block;font-size:14px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row .rp{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:right}
+.row .rn{text-align:right}
+.empty{padding:40px 0;color:var(--mut)}
+
+/* lecture */
+.read{max-width:780px}
+.path{font:13px var(--mono);color:var(--mut);overflow-wrap:anywhere}
+.read h1{font:700 clamp(28px,4vw,40px)/1.08 var(--display);letter-spacing:-.035em;margin:8px 0 10px}
+.meta{font:13px var(--mono);color:var(--mut);margin-bottom:18px}
+.resume{display:flex;gap:10px;align-items:stretch;margin-bottom:14px}
+.resume code{flex:1;min-width:0;font:13px var(--mono);background:var(--code);padding:10px 12px;border-radius:8px;overflow-x:auto;white-space:nowrap}
+.btn{padding:0 14px;border:1px solid var(--line);border-radius:8px;font-size:13.5px;font-weight:600;white-space:nowrap;background:var(--surface)}
+.btn:hover{border-color:var(--ink)}
+.tools{display:flex;gap:10px;margin-bottom:34px}
+.tools .btn{padding:7px 14px}
+.who{font:500 11px var(--mono);letter-spacing:.09em;text-transform:uppercase;margin:0 0 6px;display:flex;gap:10px}
+.who span{color:var(--mut);letter-spacing:0;text-transform:none}
+.ask{background:var(--coral-tint);border-left:3px solid var(--coral);border-radius:0 10px 10px 0;padding:14px 18px;margin:44px 0 22px;overflow-wrap:anywhere}
+.ask .who{color:var(--coral)}
+.ask .t{white-space:pre-wrap;font-size:16.5px}
+.ask.cmd{background:none;padding:6px 18px;font:13.5px var(--mono);color:var(--mut)}
+.say{margin:18px 0;overflow-wrap:anywhere}
+.say>.who{color:var(--petrol)}
+.say p{margin:0 0 12px}
+.say h3,.say h4,.say h5{font-family:var(--display);letter-spacing:-.015em;line-height:1.25;margin:24px 0 8px}
+.say h3{font-size:22px}.say h4{font-size:18.5px}.say h5{font-size:16px}
+.say ul,.say ol{margin:0 0 12px;padding-left:22px}
+.say li{margin:3px 0}
+.say li.d1{margin-left:20px}.say li.d2{margin-left:40px}
+.say blockquote{margin:0 0 12px;padding-left:14px;border-left:2px solid var(--line);color:var(--mut)}
+.say hr{border:0;border-top:1px solid var(--line);margin:20px 0}
+.say table{border-collapse:collapse;margin:0 0 14px;font-size:14.5px;display:block;overflow-x:auto}
+.say th,.say td{border-bottom:1px solid var(--line);padding:6px 14px 6px 0;text-align:left;vertical-align:top}
+.say th{font:500 11.5px var(--mono);letter-spacing:.05em;text-transform:uppercase;color:var(--mut)}
+code{font:.86em var(--mono);background:var(--code);padding:1.5px 5px;border-radius:4px}
+pre{font:13px/1.5 var(--mono);background:var(--code);padding:12px 14px;border-radius:8px;overflow-x:auto;margin:0 0 12px;white-space:pre-wrap;overflow-wrap:anywhere}
+pre code{background:none;padding:0;font-size:inherit}
+.act{margin:10px 0;border-left:1px dashed var(--line);padding-left:14px}
+.act>summary{font:12.5px var(--mono);color:var(--mut);cursor:pointer;padding:3px 0;list-style-position:outside}
+.act>summary:hover{color:var(--ink)}
+.step{margin:6px 0}
+.step>summary{font:12.5px var(--mono);cursor:pointer;color:var(--mut);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.step>summary b{color:var(--ink);font-weight:500}
+.step pre{margin:6px 0;max-height:420px;overflow-y:auto}
+.rl{font:11px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--mut);margin-top:8px}
+.cut{text-align:center;font:12px var(--mono);color:var(--mut);margin:36px 0;display:flex;gap:14px;align-items:center}
+.cut::before,.cut::after{content:"";flex:1;border-top:1px dashed var(--line)}
+mark{background:var(--marker);color:#10272b;padding:0 2px;border-radius:2px}
+.ask:target,.say:target{box-shadow:-8px 0 0 var(--paper),-11px 0 0 var(--marker)}
+
+/* résultats de recherche */
+.hitset{border-top:1px solid var(--line);padding:18px 0}
+.hitset h2{font:600 17px/1.3 var(--body);margin:0}
+.hitset h2 a{color:var(--ink);text-decoration:none}
+.hitset h2 a:hover{color:var(--petrol)}
+.hit{display:grid;grid-template-columns:62px minmax(0,1fr);gap:12px;padding:7px 0;font-size:14.5px;color:inherit;text-decoration:none;overflow-wrap:anywhere}
+.hit:hover{background:var(--surface)}
+.hit i{font:500 11px/2 var(--mono);font-style:normal;letter-spacing:.08em;text-transform:uppercase;color:var(--petrol)}
+.hit i.u{color:var(--coral)}
+.more{font:12.5px var(--mono);color:var(--mut);padding-left:74px}
+
+@media(max-width:860px){
+  .app{grid-template-columns:1fr}
+  .side{position:static;height:auto;max-height:260px;border-right:0;border-bottom:1px solid var(--line);padding:20px 18px}
+  .tag{margin-bottom:16px}
+  .row{grid-template-columns:48px minmax(0,1fr);gap:10px}
+  .row .rp,.row .rn{display:none}
+  .find button{padding:0 14px}.lg{display:none}
+  .resume{flex-direction:column}.resume .btn{padding:9px 14px}
+}
+@media(prefers-reduced-motion:reduce){*{transition:none!important;scroll-behavior:auto!important}}
+"""
+
+JS_INDEX = """
+const rows=[...document.querySelectorAll('.row')],days=[...document.querySelectorAll('.day')],
+q=document.getElementById('q'),cnt=document.getElementById('cnt'),empty=document.getElementById('empty'),
+reset=document.getElementById('reset'),term=document.getElementById('term');
+let F='',D='';
+function apply(){
+  const v=q.value.trim().toLowerCase();let n=0;
+  rows.forEach(r=>{const ok=(!F||r.dataset.f===F)&&(!D||r.dataset.d===D)&&(!v||r.dataset.k.includes(v));r.hidden=!ok;if(ok)n++});
+  days.forEach(d=>{d.hidden=!d.querySelector('.row:not([hidden])')});
+  cnt.textContent=n+(n>1?' conversations':' conversation');
+  empty.hidden=n>0;term.textContent=q.value.trim();
+  reset.hidden=!(F||D||v);
+  document.querySelectorAll('.fold').forEach(b=>b.setAttribute('aria-pressed',b.dataset.f===F));
+  document.querySelectorAll('.bar').forEach(b=>b.setAttribute('aria-pressed',b.dataset.d===D));
+}
+document.querySelectorAll('.fold').forEach(b=>b.onclick=()=>{F=b.dataset.f;apply()});
+document.querySelectorAll('.bar').forEach(b=>b.onclick=()=>{D=D===b.dataset.d?'':b.dataset.d;apply()});
+reset.onclick=()=>{F='';D='';q.value='';apply();q.focus()};
+q.oninput=apply;
+document.addEventListener('keydown',e=>{
+  if(e.key==='/'&&document.activeElement!==q){e.preventDefault();q.focus();q.select()}
+  if(e.key==='Escape'&&document.activeElement===q){q.value='';apply()}
+});
+apply();
+"""
+
+JS_READ = """
+const cp=document.getElementById('cp');
+cp.onclick=()=>navigator.clipboard.writeText(document.getElementById('cmd').textContent).then(()=>{cp.textContent='Commande copiée';setTimeout(()=>cp.textContent='Copier la commande',1600)});
+const tg=document.getElementById('tg');let open=false;
+tg.onclick=()=>{open=!open;document.querySelectorAll('.act').forEach(d=>d.open=open);tg.textContent=open?'Replier les actions':'Déplier les actions'};
+const links=new Map([...document.querySelectorAll('.toc a')].map(a=>[a.getAttribute('href').slice(1),a]));
+const io=new IntersectionObserver(es=>es.forEach(e=>{if(e.isIntersecting){links.forEach(a=>a.classList.remove('on'));const a=links.get(e.target.id);if(a){a.classList.add('on');a.scrollIntoView({block:'nearest'})}}}),{rootMargin:'0px 0px -70% 0px'});
+document.querySelectorAll('.ask[id]').forEach(el=>io.observe(el));
+if(location.hash){const t=document.getElementById(location.hash.slice(1));if(t)t.scrollIntoView()}
+"""
+
+
+def esc(s):
+    return html.escape(str(s), quote=True)
+
+
+def shell(title, side, main, script=""):
+    return (
+        "<!doctype html><html lang=fr><head><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        f"<title>{esc(title)}</title>{FONTS}<style>{CSS}</style></head><body>"
+        f"<div class=app><aside class=side>{side}</aside><main class=main>{main}</main></div>"
+        f"<script>{script}</script></body></html>"
+    ).encode("utf-8")
+
+
+BRAND = "<a class=brand href='/'>journal<i>.</i></a><p class=tag>tes conversations Claude Code</p>"
+
+
+# ---------- lecture des fichiers ----------
+
+def iter_records(path):
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if line.startswith('{"type":"api-request'):
+                continue
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(o, dict):
+                yield o
+
+
+def blocks(o):
+    m = o.get("message")
+    c = m.get("content") if isinstance(m, dict) else None
+    if isinstance(c, str):
+        return [{"type": "text", "text": c}]
+    if isinstance(c, list):
+        return [b for b in c if isinstance(b, dict)]
+    return []
+
+
+def plain(o):
+    return "\n".join(b.get("text", "") for b in blocks(o) if b.get("type") == "text")
+
+
+def clean(text):
+    return REMINDER.sub("", text).strip()
+
+
+def to_dt(ts):
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+    except (ValueError, AttributeError):
+        return None
+
+
+def short(path):
+    return "~" + path[len(HOME):] if path.startswith(HOME) else path
+
+
+def long_date(d, with_day=True):
+    s = f"{d.day} {MOIS[d.month - 1]}"
+    if d.year != date.today().year:
+        s += f" {d.year}"
+    return f"{JOURS[d.weekday()]} {s}" if with_day else s
+
+
+def day_label(d):
+    today = date.today()
+    if d == today:
+        return "Aujourd'hui"
+    if d == today - timedelta(days=1):
+        return "Hier"
+    return long_date(d).capitalize()
+
+
+def load_cache():
+    try:
+        for k, v in json.loads(CACHE_FILE.read_text()).items():
+            CACHE[k] = v
+    except (OSError, ValueError):
+        pass
+
+
+def save_cache(keep):
+    atomic_write(CACHE_FILE, json.dumps({k: CACHE[k] for k in keep}))
+
+
+def summarize(path):
+    st = path.stat()
+    key = f"{path}|{st.st_mtime}|{st.st_size}"
+    if key in CACHE:
+        return key, CACHE[key]
+    title = first = cwd = last_ts = model = ""
+    n = 0
+    for o in iter_records(path):
+        t = o.get("type")
+        if t == "ai-title":
+            title = o.get("aiTitle") or title
+        elif t in ("user", "assistant") and not o.get("isSidechain"):
+            cwd = cwd or o.get("cwd") or ""
+            last_ts = o.get("timestamp") or last_ts
+            if t == "assistant":
+                model = (o.get("message") or {}).get("model") or model
+            elif not o.get("isMeta"):
+                txt = clean(plain(o))
+                if txt and not txt.startswith("<"):
+                    n += 1
+                    first = first or txt[:300]
+    dt = to_dt(last_ts)
+    info = {
+        "project": path.parent.name,
+        "id": path.stem,
+        "title": title or first[:80] or "(sans titre)",
+        "first": first,
+        "cwd": cwd or path.parent.name,
+        "n": n,
+        "ts": dt.timestamp() if dt else st.st_mtime,
+        "model": model,
+    }
+    CACHE[key] = info
+    return key, info
+
+
+def sessions():
+    before = len(CACHE)
+    pairs = [summarize(p) for p in ROOT.glob("*/*.jsonl")]
+    if len(CACHE) != before:
+        save_cache([k for k, _ in pairs])
+    out = [s for _, s in pairs if s["n"]]
+    out.sort(key=lambda s: s["ts"], reverse=True)
+    return out
+
+
+# ---------- recherche dans les messages ----------
+
+def raw_needle(ql):
+    """Le motif tel qu'il apparaît dans une ligne JSON brute (guillemets échappés, etc.)."""
+    return json.dumps(ql, ensure_ascii=False)[1:-1]
+
+
+def candidates(needle):
+    """Fichiers pouvant contenir le motif selon rg, ou None s'il faut tous les lire."""
+    rg = shutil.which("rg")
+    if not rg:
+        return None
+    try:
+        r = subprocess.run(
+            [rg, "-l", "-i", "-F", "-uu", "--glob", "*.jsonl", "--max-depth", "2", "-e", needle, str(ROOT)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return set(r.stdout.splitlines()) if r.returncode in (0, 1) else None
+
+
+def file_hits(path, ql, needle):
+    hits = []
+    try:
+        f = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return hits
+    with f:
+        for line in f:
+            if line.startswith('{"type":"api-request') or needle not in line.lower():
+                continue
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(o, dict):
+                continue
+            if o.get("type") not in ("user", "assistant") or o.get("isSidechain") or o.get("isMeta"):
+                continue
+            txt = plain(o) if o["type"] == "assistant" else clean(plain(o))
+            i = txt.lower().find(ql)
+            if i >= 0:
+                hits.append((o.get("uuid", ""), o["type"] == "user", txt, i))
+    return hits
+
+
+def search_hits(q):
+    """[(session, [(uuid, est_utilisateur, texte, position), ...]), ...] dans l'ordre de sessions()."""
+    ql = q.lower().strip()
+    if len(ql) < 2:
+        return []
+    needle = raw_needle(ql)
+    keep = candidates(needle)
+    found = []
+    for s in sessions():
+        path = ROOT / s["project"] / (s["id"] + ".jsonl")
+        if keep is not None and str(path) not in keep:
+            continue
+        hits = file_hits(path, ql, needle)
+        if hits:
+            found.append((s, hits))
+    return found
+
+
+def snippet(txt, i, n):
+    a, b = max(0, i - 80), i + n + 160
+    return ("... " if a else "") + txt[a:i], txt[i:i + n], txt[i + n:b] + (" ..." if b < len(txt) else "")
+
+
+# ---------- rendu du texte ----------
+
+def inline(s):
+    s = esc(s)
+    codes = []
+
+    def stash(m):
+        codes.append(m.group(1))
+        return f"\x00{len(codes) - 1}\x00"
+
+    s = re.sub(r"`([^`\n]+)`", stash, s)
+    s = re.sub(r"\[([^\]\n]+)\]\((https?://[^\s)]+)\)", r'<a href="\2" target="_blank" rel="noopener">\1</a>', s)
+    s = re.sub(r"\*\*([^*\n]+)\*\*", r"<strong>\1</strong>", s)
+    s = re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"<em>\1</em>", s)
+    return re.sub(r"\x00(\d+)\x00", lambda m: f"<code>{codes[int(m.group(1))]}</code>", s)
+
+
+def cells(line):
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def prose(text):
+    out, para, lst = [], [], None
+    lines = text.split("\n")
+
+    def close():
+        nonlocal lst
+        if para:
+            out.append("<p>" + "<br>".join(inline(x) for x in para) + "</p>")
+            para.clear()
+        if lst:
+            out.append(f"</{lst}>")
+            lst = None
+
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        s = ln.strip()
+        m_h = re.match(r"(#{1,6})\s+(.*)", s)
+        m_li = re.match(r"(\s*)([-*+]|\d+[.)])\s+(.*)", ln)
+        if not s:
+            close()
+        elif m_h:
+            close()
+            lvl = min(len(m_h.group(1)) + 2, 5)
+            out.append(f"<h{lvl}>{inline(m_h.group(2))}</h{lvl}>")
+        elif re.fullmatch(r"(-{3,}|\*{3,}|_{3,})", s):
+            close()
+            out.append("<hr>")
+        elif s.startswith("|") and i + 1 < len(lines) and re.fullmatch(r"\|?[\s:|-]+\|?", lines[i + 1].strip()) and "-" in lines[i + 1]:
+            close()
+            out.append("<table><tr>" + "".join(f"<th>{inline(c)}</th>" for c in cells(s)) + "</tr>")
+            i += 2
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                out.append("<tr>" + "".join(f"<td>{inline(c)}</td>" for c in cells(lines[i])) + "</tr>")
+                i += 1
+            out.append("</table>")
+            continue
+        elif m_li:
+            kind = "ol" if m_li.group(2)[0].isdigit() else "ul"
+            if para or lst != kind:
+                close()
+                out.append(f"<{kind}>")
+                lst = kind
+            depth = min(len(m_li.group(1).replace("\t", "  ")) // 2, 2)
+            out.append(f"<li class=d{depth}>{inline(m_li.group(3))}</li>")
+        elif s.startswith(">"):
+            close()
+            out.append(f"<blockquote>{inline(s.lstrip('> '))}</blockquote>")
+        else:
+            if lst:
+                close()
+            para.append(s)
+        i += 1
+    close()
+    return "".join(out)
+
+
+def md(text):
+    parts = re.split(r"```([^\n]*)\n(.*?)(?:```|\Z)", text, flags=re.S)
+    out = []
+    for i in range(0, len(parts), 3):
+        out.append(prose(parts[i]))
+        if i + 2 < len(parts):
+            out.append(f"<pre><code>{esc(parts[i + 2].rstrip())}</code></pre>")
+    return "".join(out)
+
+
+def clip(s):
+    s = s if isinstance(s, str) else json.dumps(s, ensure_ascii=False, indent=2)
+    if len(s) > MAX_BLOCK:
+        s = s[:MAX_BLOCK] + f"\n[... tronqué, {len(s) - MAX_BLOCK} caractères de plus]"
+    return esc(s)
+
+
+def result_text(b):
+    c = b.get("content")
+    if isinstance(c, list):
+        return "\n".join(x.get("text", f"[{x.get('type')}]") for x in c if isinstance(x, dict))
+    return c if isinstance(c, str) else ""
+
+
+def tool_hint(inp):
+    if isinstance(inp, dict):
+        for k in ("description", "command", "file_path", "pattern", "query", "url", "skill", "prompt", "path"):
+            v = inp.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip().splitlines()[0][:140]
+    return ""
+
+
+# ---------- pages ----------
+
+def render_session(path):
+    _, info = summarize(path)
+    out, toc, pend, results = [], [], [], {}
+    state = {"label": True, "first": None}
+
+    def who_claude(ts):
+        if not state["label"]:
+            return ""
+        state["label"] = False
+        dt = to_dt(ts)
+        return f"<div class=who>Claude <span>{dt.strftime('%H:%M') if dt else ''}</span></div>"
+
+    def flush(ts=None):
+        if not pend:
+            return
+        names = Counter(p[1] for p in pend if p[0] == "tool")
+        label = actions_label(names) if names else "Réflexion"
+        steps = []
+        for kind, name, payload, tid in pend:
+            if kind == "think":
+                steps.append(f"<details class=step><summary><b>Réflexion</b></summary><pre>{clip(payload)}</pre></details>")
+                continue
+            res = results.get(tid)
+            body = f"<pre>{clip(payload)}</pre>"
+            if res:
+                body += f"<div class=rl>Résultat</div><pre>{clip(res)}</pre>"
+            steps.append(f"<details class=step><summary><b>{esc(name)}</b> {esc(tool_hint(payload))}</summary>{body}</details>")
+        out.append(f"<div class=say>{who_claude(ts)}<details class=act><summary>{esc(label)}</summary>{''.join(steps)}</details></div>")
+        pend.clear()
+
+    for o in iter_records(path):
+        t = o.get("type")
+        if o.get("isSidechain"):
+            continue
+        if t == "system" and o.get("subtype") == "compact_boundary":
+            flush()
+            out.append("<div class=cut>contexte compacté ici</div>")
+            continue
+        if t not in ("user", "assistant"):
+            continue
+        ts, uid = o.get("timestamp"), esc(o.get("uuid", ""))
+        state["first"] = state["first"] or ts
+        for b in blocks(o):
+            bt = b.get("type")
+            if bt == "tool_result":
+                results[b.get("tool_use_id")] = result_text(b)
+            elif bt == "thinking":
+                if b.get("thinking"):
+                    pend.append(("think", "", b["thinking"], None))
+            elif bt in ("tool_use", "server_tool_use"):
+                pend.append(("tool", b.get("name", "?"), b.get("input", {}), b.get("id")))
+            elif bt == "text" and t == "assistant":
+                if b.get("text", "").strip():
+                    flush(ts)
+                    out.append(f"<div class=say id='m-{uid}'>{who_claude(ts)}{md(b['text'])}</div>")
+                    uid += "-n"
+            elif bt == "text" and not o.get("isMeta"):
+                txt = clean(b.get("text", ""))
+                cmd = COMMAND.search(txt)
+                if cmd:
+                    flush()
+                    out.append(f"<div class='ask cmd'>{esc(cmd.group(1))} {esc((cmd.group(2) or '').strip())}</div>")
+                elif txt and not txt.startswith("<"):
+                    flush()
+                    state["label"] = True
+                    dt = to_dt(ts)
+                    stamp = dt.strftime("%H:%M") if dt else ""
+                    toc.append(f"<li><a href='#m-{uid}'><span>{esc(txt[:110])}</span></a></li>")
+                    out.append(f"<div class=ask id='m-{uid}'><div class=who>Toi <span>{stamp}</span></div><div class=t>{esc(txt)}</div></div>")
+                    uid += "-n"
+    flush()
+
+    start = to_dt(state["first"])
+    when = f"{long_date(start.date())}, {start.strftime('%H:%M')}" if start else ""
+    meta = " · ".join(x for x in (when, f"{info['n']} message{'s' if info['n'] > 1 else ''} de toi", info.get("model", "")) if x)
+    cmd = f"cd {info['cwd']} && claude --resume {info['id']}"
+    head = (
+        f"<div class=path>{esc(short(info['cwd']))}</div><h1>{esc(info['title'])}</h1>"
+        f"<div class=meta>{esc(meta)}</div>"
+        f"<div class=resume><code id=cmd>{esc(cmd)}</code><button class=btn id=cp>Copier la commande</button></div>"
+        "<div class=tools><button class=btn id=tg>Déplier les actions</button></div>"
+    )
+    side = (
+        "<a class=back href='/'>&larr; toutes les conversations</a>"
+        "<p class=cap>Tes messages</p><ul class=toc>" + "".join(toc) + "</ul>"
+    )
+    return shell(info["title"], side, f"<article class=read>{head}{''.join(out)}</article>", JS_READ)
+
+
+def render_index():
+    ss = sessions()
+    folders = {}
+    per_day = Counter()
+    groups = {}
+    for s in ss:
+        dt = datetime.fromtimestamp(s["ts"])
+        d = dt.date()
+        per_day[d] += 1
+        f = folders.setdefault(s["cwd"], [0, s["ts"]])
+        f[0] += 1
+        k = esc(f"{s['title']} {s['cwd']} {s['first']}".lower())
+        rf = "" if s["first"].startswith(s["title"]) else f"<span class=rf>{esc(s['first'][:200])}</span>"
+        groups.setdefault(d, []).append(
+            f"<a class=row href='/s/{s['project']}/{s['id']}' data-f=\"{esc(s['cwd'])}\" data-d='{d.isoformat()}' data-k=\"{k}\">"
+            f"<time>{dt.strftime('%H:%M')}</time>"
+            f"<span><b>{esc(s['title'])}</b>{rf}</span>"
+            f"<span class=rp>&lrm;{esc(short(s['cwd']))}</span>"
+            f"<span class=rn>{s['n']} msg</span></a>"
+        )
+
+    side = [BRAND, "<p class=cap>Dossiers</p>",
+            f"<button class=fold data-f=''><b>Tous les dossiers</b><s>{len(ss)}</s></button>"]
+    for cwd, (n, _) in sorted(folders.items(), key=lambda kv: -kv[1][1]):
+        sp = short(cwd)
+        name = sp.rstrip("/").rsplit("/", 1)[-1] or sp
+        side.append(
+            f"<button class=fold data-f=\"{esc(cwd)}\" title=\"{esc(sp)}\"><b>{esc(name)}</b><s>{n}</s>"
+            + ("" if name == sp else f"<small>&lrm;{esc(sp)}</small>") + "</button>"
+        )
+
+    ribbon = ""
+    if per_day:
+        first, today = min(per_day), date.today()
+        peak = max(per_day.values())
+        bars = []
+        d = first
+        while d <= today:
+            c = per_day.get(d, 0)
+            tip = f"{long_date(d)} : {c} conversation{'s' if c > 1 else ''}" if c else f"{long_date(d)} : rien"
+            bars.append(
+                f"<button class='bar{'' if c else ' none'}' data-d='{d.isoformat()}' title=\"{esc(tip)}\" aria-label=\"{esc(tip)}\""
+                f"{'' if c else ' disabled'} style='--h:{round(100 * c / peak)}%'><span></span></button>"
+            )
+            d += timedelta(days=1)
+        ribbon = (
+            f"<div class=ribbon><div class=bars>{''.join(bars)}</div>"
+            f"<div class=ends><span>{long_date(first, False)}</span><span class=lg>un trait par jour, clique pour isoler une journée</span><span>aujourd'hui</span></div></div>"
+        )
+
+    days = "".join(
+        f"<section class=day><h2>{day_label(d)}</h2>{''.join(rows)}</section>"
+        for d, rows in sorted(groups.items(), reverse=True)
+    )
+    main = (
+        "<form class=find action=/search><input id=q name=q autocomplete=off autofocus "
+        "placeholder='Filtrer par titre, dossier ou premier message'>"
+        "<button>Chercher<span class=lg> dans les messages</span></button></form>"
+        "<p class=hint><kbd>/</kbd> pour filtrer la liste, <kbd>Entrée</kbd> pour chercher dans tout le texte des conversations</p>"
+        + ribbon
+        + "<p class=count><span id=cnt></span><button class=reset id=reset hidden>tout réafficher</button></p>"
+        + days
+        + "<p class=empty id=empty hidden>Aucun titre ni dossier ne contient « <span id=term></span> ». "
+        "Appuie sur Entrée pour chercher ce mot dans le texte des messages.</p>"
+    )
+    return shell("Journal Claude Code", "".join(side), main, JS_INDEX)
+
+
+def render_search(q):
+    ql = q.lower().strip()
+    sets, total = [], 0
+    for s, hits in search_hits(q):
+        total += len(hits)
+        url = f"/s/{s['project']}/{s['id']}"
+        when = long_date(datetime.fromtimestamp(s["ts"]).date(), False)
+        block = [f"<section class=hitset><h2><a href='{url}'>{esc(s['title'])}</a></h2>"
+                 f"<div class=path>{esc(short(s['cwd']))} · {when}</div>"]
+        for uid, mine, txt, i in hits[:5]:
+            pre, mid, post = snippet(txt, i, len(ql))
+            snip = esc(pre) + "<mark>" + esc(mid) + "</mark>" + esc(post)
+            block.append(f"<a class=hit href='{url}#m-{esc(uid)}'><i class='{'u' if mine else ''}'>{'Toi' if mine else 'Claude'}</i><span>{snip}</span></a>")
+        if len(hits) > 5:
+            block.append(f"<div class=more>et {len(hits) - 5} autres passages dans cette conversation</div>")
+        block.append("</section>")
+        sets.append("".join(block))
+    if len(ql) < 2:
+        status = "Tape au moins deux caractères."
+    elif not total:
+        status = f"Aucun message ne contient « {esc(q)} ». Essaie un mot plus court ou une autre orthographe."
+    else:
+        status = f"{total} passage{'s' if total > 1 else ''} dans {len(sets)} conversation{'s' if len(sets) > 1 else ''}"
+    main = (
+        f"<form class=find action=/search><input name=q value=\"{esc(q)}\" autocomplete=off autofocus>"
+        "<button>Chercher<span class=lg> dans les messages</span></button></form>"
+        f"<p class=count>{status}</p>" + "".join(sets)
+    )
+    side = BRAND + "<a class=back href='/'>&larr; toutes les conversations</a>"
+    return shell(f"Recherche : {q}", side, main)
+
+
+# ---------- terminal ----------
+
+ABBR = ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."]
+DIM, BOLD, CYAN, REV, RST = "\033[2m", "\033[1m", "\033[36m", "\033[7m", "\033[0m"
+CTRL = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def actions_label(names):
+    total = sum(names.values())
+    top = ", ".join(f"{n} ×{c}" if c > 1 else n for n, c in names.most_common(4))
+    return f"{total} action{'s' if total > 1 else ''} : {top}{', ...' if len(names) > 4 else ''}"
+
+
+def one_line(s):
+    return " ".join(CTRL.sub(" ", s).split())
+
+
+def list_line(s, count, tail):
+    d = datetime.fromtimestamp(s["ts"]).date()
+    when = f"{d.day:2d} {ABBR[d.month - 1]}" + (f" {d.year}" if d.year != date.today().year else "")
+    show = (
+        f"{when:<8}  {BOLD}{one_line(s['title'])[:60]}{RST}  "
+        f"{CYAN}{one_line(short(s['cwd']))}{RST}  {DIM}{count}"
+    )
+    tail = one_line(tail)
+    if tail:
+        show += f" · {tail}"
+    return f"{s['project']}\t{s['id']}\t{show}{RST}"
+
+
+def list_lines():
+    for s in sessions():
+        tail = "" if s["first"].startswith(s["title"]) else s["first"][:200]
+        yield list_line(s, f"{s['n']} msg", tail)
+
+
+def hhmm(ts):
+    dt = to_dt(ts)
+    return dt.strftime("%H:%M") if dt else ""
+
+
+def write_head(info, w):
+    dt = datetime.fromtimestamp(info["ts"])
+    meta = " · ".join(x for x in (
+        f"{long_date(dt.date())}, {dt.strftime('%H:%M')}",
+        f"{info['n']} message{'s' if info['n'] > 1 else ''} de toi",
+        info.get("model", ""),
+    ) if x)
+    w(f"{CYAN}{one_line(short(info['cwd']))}{RST}\n{BOLD}{one_line(info['title'])}{RST}\n{DIM}{meta}{RST}\n")
+
+
+def write_text(path, out):
+    try:
+        _write_text(path, out.write)
+    except BrokenPipeError:
+        pass
+
+
+def _write_text(path, w):
+    _, info = summarize(path)
+    write_head(info, w)
+    pend = Counter()
+    state = {"label": True, "fresh": False, "ts": None}
+
+    def claude():
+        if state["label"]:
+            state["label"] = False
+            state["fresh"] = True
+            w(f"\n{BOLD}Claude {hhmm(state['ts'])}{RST}\n")
+
+    def flush():
+        if pend:
+            claude()
+            w(f"{DIM}  [{actions_label(pend)}]{RST}\n")
+            pend.clear()
+            state["fresh"] = True
+
+    for o in iter_records(path):
+        t = o.get("type")
+        if o.get("isSidechain"):
+            continue
+        if t == "system" and o.get("subtype") == "compact_boundary":
+            flush()
+            w(f"\n{DIM}--- contexte compacté ici ---{RST}\n")
+            continue
+        if t not in ("user", "assistant"):
+            continue
+        ts = o.get("timestamp")
+        for b in blocks(o):
+            bt = b.get("type")
+            if bt in ("tool_use", "server_tool_use"):
+                state["ts"] = state["ts"] if pend else ts
+                pend[b.get("name", "?")] += 1
+            elif bt == "text" and t == "assistant":
+                if b.get("text", "").strip():
+                    if not pend:
+                        state["ts"] = ts
+                    flush()
+                    claude()
+                    if not state["fresh"]:
+                        w("\n")
+                    state["fresh"] = False
+                    w(b["text"].strip() + "\n")
+            elif bt == "text" and not o.get("isMeta"):
+                txt = clean(b.get("text", ""))
+                cmd = COMMAND.search(txt)
+                if cmd:
+                    flush()
+                    w(f"\n{DIM}{cmd.group(1)} {(cmd.group(2) or '').strip()}{RST}\n")
+                elif txt and not txt.startswith("<"):
+                    flush()
+                    state["label"] = True
+                    w(f"\n{BOLD}{CYAN}Toi {hhmm(ts)}{RST}\n{txt}\n")
+    flush()
+
+
+# ---------- index plein texte du terminal ----------
+#
+# Pour chaque conversation : une ligne d'en-tête (titre, dossier, premier message)
+# puis une ligne par message visible. "o" garde le texte d'origine, "f" le même
+# texte replié (minuscules, sans accents) caractère pour caractère, donc les
+# positions trouvées dans "f" valent dans "o". "r" donne le rôle de chaque ligne.
+
+CTRL1 = re.compile(r"[\x00-\x1f\x7f]")
+INDEX_VERSION = 2
+PASSAGES_MAX = 30
+
+
+class _Fold(dict):
+    def __missing__(self, code):
+        c = chr(code)
+        base = "".join(x for x in unicodedata.normalize("NFKD", c) if not unicodedata.combining(x))
+        r = (base[:1] or c).lower()[:1] or c
+        self[code] = r
+        return r
+
+
+FOLD = _Fold()
+
+
+def fold(s):
+    """Minuscules et sans accents, sans changer la longueur du texte."""
+    return s.lower() if s.isascii() else s.translate(FOLD)
+
+
+def text_file():
+    return CACHE_FILE.with_name("text.json")
+
+
+def atomic_write(path, data):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        # 0600 : ces fichiers contiennent le texte des conversations, privées elles aussi.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def build_entry(path, key, info):
+    # short() : sinon « /home/<toi> » ferait correspondre tous les dossiers à la recherche « home ».
+    roles, lines = ["h"], [f"{info['title']} · {short(info['cwd'])} · {info['first']}"]
+    for o in iter_records(path):
+        t = o.get("type")
+        if t not in ("user", "assistant") or o.get("isSidechain") or o.get("isMeta"):
+            continue
+        for b in blocks(o):
+            if b.get("type") != "text":
+                continue
+            txt = b.get("text", "") if t == "assistant" else clean(b.get("text", ""))
+            if not txt.strip() or (t == "user" and (txt.startswith("<") or COMMAND.search(txt))):
+                continue
+            roles.append("u" if t == "user" else "a")
+            lines.append(txt.strip())
+    orig = "\n".join(CTRL1.sub(" ", x) for x in lines)
+    return {"v": INDEX_VERSION, "k": key, "r": "".join(roles), "o": orig, "f": fold(orig)}
+
+
+def load_text_index():
+    try:
+        idx = json.loads(text_file().read_text(encoding="utf-8"))
+        return idx if isinstance(idx, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def refresh_index(write=True, notice=False):
+    """{chemin: entrée} pour toutes les conversations listées.
+
+    write=True reconstruit ce qui a changé et enregistre l'index. write=False
+    (rechargements de fzf, qui peuvent tourner en parallèle) n'écrit rien et
+    garde une entrée périmée plutôt que de relire un gros fichier à chaque lettre.
+    """
+    old = load_text_index()
+    out, todo = {}, []
+    for s in sessions():
+        path = ROOT / s["project"] / (s["id"] + ".jsonl")
+        key, info = summarize(path)
+        e = old.get(str(path))
+        if not isinstance(e, dict) or e.get("v") != INDEX_VERSION or (write and e.get("k") != key):
+            todo.append((path, key, info))
+        else:
+            out[str(path)] = e
+    if notice and len(todo) > 3:
+        err(f"Indexation de {len(todo)} conversations, ça ne se fait qu'une fois...")
+    for path, key, info in todo:
+        out[str(path)] = build_entry(path, key, info)
+    changed = bool(todo)
+    if write and (changed or len(out) != len(old)):
+        atomic_write(text_file(), json.dumps(out, ensure_ascii=False))
+    return out
+
+
+def query_terms(q):
+    return fold(q).split()
+
+
+def term_patterns(terms):
+    """Un mot cherché doit commencer un mot du texte : « ui » trouve « ui/ux » mais pas « suis »."""
+    return [re.compile(("(?<![a-z0-9])" if t[0].isalnum() else "") + re.escape(t)) for t in terms]
+
+
+def line_hits(lines, pats):
+    """Messages qui contiennent tous les mots, ou à défaut au moins un."""
+    every = [i for i in range(1, len(lines)) if all(p.search(lines[i]) for p in pats)]
+    return every or [i for i in range(1, len(lines)) if any(p.search(lines[i]) for p in pats)]
+
+
+def first_pos(folded, pats):
+    pos = [m.start() for m in (p.search(folded) for p in pats) if m]
+    return min(pos) if pos else 0
+
+
+def find(q, idx=None):
+    """[(session, entrée, numéros des lignes trouvées)] : titre ou dossier d'abord, puis par date."""
+    terms = query_terms(q)
+    if not terms:
+        return []
+    idx = refresh_index(write=False) if idx is None else idx
+    pats = term_patterns(terms)
+    first, rest = [], []
+    for s in sessions():
+        e = idx.get(str(ROOT / s["project"] / (s["id"] + ".jsonl")))
+        if not e or not all(t in e["f"] for t in terms) or not all(p.search(e["f"]) for p in pats):
+            continue
+        lines = e["f"].split("\n")
+        hits = line_hits(lines, pats)
+        (first if all(p.search(lines[0]) for p in pats) else rest).append((s, e, hits))
+    return first + rest
+
+
+def excerpt(orig, folded, pats):
+    """Extrait autour du premier mot trouvé, chaque mot cherché en vidéo inverse."""
+    i = first_pos(folded, pats)
+    a, b = max(0, i - 80), min(len(orig), i + 200)
+    o = orig[a:b]
+    marks = [False] * len(o)
+    for p in pats:
+        for m in p.finditer(folded, a, b):
+            for k in range(m.start() - a, min(m.end() - a, len(o))):
+                marks[k] = True
+    out, on = [], False
+    for c, m in zip(o, marks):
+        if m != on:
+            out.append(REV if m else RST)
+            on = m
+        out.append(c)
+    if on:
+        out.append(RST)
+    return ("... " if a else "") + "".join(out) + (" ..." if b < len(orig) else "")
+
+
+def plain_excerpt(orig, folded, pats):
+    a = max(0, first_pos(folded, pats) - 40)
+    return ("... " if a else "") + orig[a:a + 200]
+
+
+def search_lines(q, idx=None):
+    terms = query_terms(q)
+    if not terms:
+        yield from list_lines()
+        return
+    found = find(q, idx)
+    if not found:
+        yield f"\t\t{DIM}Aucune conversation ne contient « {one_line(q.strip())} ». Essaie moins de mots ou un mot plus court.{RST}"
+        return
+    for s, e, hits in found:
+        if not hits:
+            tail = "" if s["first"].startswith(s["title"]) else s["first"][:200]
+            yield list_line(s, f"{s['n']} msg", tail)
+            continue
+        k = len(hits)
+        i = hits[0]
+        tail = plain_excerpt(e["o"].split("\n")[i], e["f"].split("\n")[i], term_patterns(terms))
+        yield list_line(s, f"{k} passage{'s' if k > 1 else ''}", tail)
+
+
+def write_hits(path, q, out):
+    """Aperçu d'une conversation pour une recherche : ses passages, ou tout le texte si seul le titre correspond."""
+    terms = query_terms(q)
+    w = out.write
+    try:
+        key, info = summarize(path)
+        e = refresh_index(write=False).get(str(path)) or build_entry(path, key, info)
+        o, f = e["o"].split("\n"), e["f"].split("\n")
+        pats = term_patterns(terms)
+        hits = line_hits(f, pats) if terms else []
+        if not hits:
+            _write_text(path, w)
+            return
+        write_head(info, w)
+        k = len(hits)
+        w(f"{DIM}{k} passage{'s' if k > 1 else ''} pour « {one_line(q.strip())} »"
+          f"{f', les {PASSAGES_MAX} premiers' if k > PASSAGES_MAX else ''} · Ctrl-O pour tout lire{RST}\n")
+        for i in hits[:PASSAGES_MAX]:
+            who = f"{CYAN}Toi" if e["r"][i] == "u" else "Claude"
+            w(f"\n{BOLD}{who}{RST}\n{excerpt(o[i], f[i], pats)}\n")
+    except BrokenPipeError:
+        pass
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def send(self, body, code=200):
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        u = urllib.parse.urlparse(self.path)
+        try:
+            if u.path == "/":
+                return self.send(render_index())
+            if u.path == "/search":
+                q = urllib.parse.parse_qs(u.query).get("q", [""])[0]
+                return self.send(render_search(q))
+            parts = u.path.strip("/").split("/")
+            if len(parts) == 3 and parts[0] == "s" and SAFE.match(parts[1]) and SAFE.match(parts[2]):
+                path = ROOT / parts[1] / (parts[2] + ".jsonl")
+                if path.is_file():
+                    return self.send(render_session(path))
+            side = BRAND
+            main = "<p class=empty>Cette conversation n'existe plus sur le disque. <a href='/'>Revenir à la liste</a></p>"
+            self.send(shell("Introuvable", side, main), 404)
+        except BrokenPipeError:
+            pass
+
+
+def serve(port, open_browser):
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError as e:
+        sys.exit(f"Port {port} indisponible ({e}). Essaie : claude-history web {port + 1}")
+    load_cache()
+    url = f"http://127.0.0.1:{port}/"
+    print(f"claude-history sur {url} (Ctrl+C pour arrêter)")
+    if open_browser:
+        webbrowser.open(url)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print()
+
+
+# ---------- commandes ----------
+
+PROMPT = "chercher> "
+HEADER = ("Tape des mots, dans n'importe quel ordre : titre, dossier ou contenu des messages\n"
+          "Entrée reprendre · Ctrl-O lire en entier · Échap quitter")
+
+
+def err(msg):
+    print(msg, file=sys.stderr)
+
+
+def self_cmd():
+    return shlex.quote(sys.executable) + " " + shlex.quote(os.path.abspath(__file__))
+
+
+def resume_command(info):
+    return f"cd {shlex.quote(info['cwd'])} && claude --resume {info['id']}"
+
+
+def resume(info):
+    cwd, why = info["cwd"], ""
+    if not os.path.isdir(cwd):
+        why = f"Le dossier d'origine n'existe plus : {cwd}"
+    elif not shutil.which("claude"):
+        why = "La commande claude est introuvable dans le PATH."
+    if why:
+        err(why)
+        err("Commande de reprise :")
+        err(resume_command(info))
+        return 1
+    err(f"Reprise dans {short(cwd)}")
+    os.chdir(cwd)
+    os.execvp("claude", ["claude", "--resume", info["id"]])
+    return 0
+
+
+def fzf_args(me):
+    # --disabled : fzf ne filtre pas lui-même, chaque frappe relance « query » qui cherche partout.
+    return [
+        "--ansi", "--disabled", "--delimiter=\t", "--with-nth=3..", "--layout=reverse",
+        f"--prompt={PROMPT}", f"--header={HEADER}",
+        f"--preview={me} preview {{1}} {{2}} {{q}}", "--preview-window=right,55%,wrap",
+        f"--bind=change:reload:{me} query {{q}}",
+        f"--bind=ctrl-o:execute:{me} show {{1}} {{2}}",
+    ]
+
+
+def session_path(project, sid):
+    if SAFE.match(project) and SAFE.match(sid):
+        path = ROOT / project / (sid + ".jsonl")
+        if path.is_file():
+            return path
+    err("Cette conversation n'existe plus sur le disque.")
+    return None
+
+
+def found_sessions(query, limit=25):
+    """Sessions correspondant à la requête (récentes d'abord), ou les plus récentes si vide."""
+    if not query_terms(query):
+        return sessions()[:limit]
+    return [s for s, _, _ in find(query)][:limit]
+
+
+def pick_plain(read=input):
+    """Sélecteur de secours en Python pur, quand fzf n'est pas là."""
+    if not sessions():
+        err("Aucune conversation dans ~/.claude/projects.")
+        return 1
+    refresh_index(write=True, notice=True)
+    print("Tape des mots pour filtrer, un numéro pour reprendre, Entrée pour quitter.")
+    query = ""
+    while True:
+        rows = found_sessions(query)
+        print()
+        if not rows:
+            print(f"Rien pour « {query} ». Essaie d'autres mots.")
+        for i, s in enumerate(rows, 1):
+            d = datetime.fromtimestamp(s["ts"]).date()
+            when = f"{d.day:2d} {ABBR[d.month - 1]}"
+            print(f"{i:2d}. {when}  {one_line(s['title'])[:48]:<48}  {DIM}{short(s['cwd'])}{RST}")
+        try:
+            choice = read(f"\n{PROMPT}").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if not choice:
+            return 0
+        if choice.isdigit():
+            n = int(choice)
+            if 1 <= n <= len(rows):
+                return resume(rows[n - 1])
+            print("Numéro hors de la liste.")
+        else:
+            query = choice
+
+
+def pick():
+    lines = list(list_lines())
+    if not lines:
+        err("Aucune conversation dans ~/.claude/projects.")
+        return 1
+    fzf = None if os.environ.get("CLAUDE_HISTORY_NO_FZF") else shutil.which("fzf")
+    if not fzf:
+        return pick_plain()
+    refresh_index(write=True, notice=True)
+    try:
+        r = subprocess.run([fzf, *fzf_args(self_cmd())], input="\n".join(lines) + "\n",
+                           stdout=subprocess.PIPE, text=True, encoding="utf-8")
+    except KeyboardInterrupt:
+        return 0
+    if r.returncode in (1, 130):
+        return 0
+    if r.returncode:
+        return r.returncode
+    parts = r.stdout.rstrip("\n").split("\t")
+    if len(parts) < 2 or not parts[0]:  # rien choisi, ou la ligne « Aucune conversation »
+        return 0
+    path = session_path(parts[0], parts[1])
+    return resume(summarize(path)[1]) if path else 1
+
+
+def quiet_pipe():
+    """Le lecteur est parti (head, fzf) : éviter l'erreur à la fermeture de stdout."""
+    try:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def emit(lines):
+    try:
+        for line in lines:
+            sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        quiet_pipe()
+
+
+def show(path):
+    if sys.stdout.isatty() and shutil.which("less"):
+        p = subprocess.Popen(["less", "-R"], stdin=subprocess.PIPE, text=True, encoding="utf-8")
+        try:
+            write_text(path, p.stdin)
+            p.stdin.close()
+        except (BrokenPipeError, KeyboardInterrupt):
+            pass
+        while True:
+            try:
+                p.wait()
+                break
+            except KeyboardInterrupt:
+                continue
+    else:
+        write_text(path, sys.stdout)
+        try:
+            sys.stdout.flush()
+        except BrokenPipeError:
+            quiet_pipe()
+
+
+def write_markdown(path, out):
+    """Écrit une conversation en Markdown propre (sans couleurs), pour la partager."""
+    w = out.write
+    try:
+        _, info = summarize(path)
+        dt = datetime.fromtimestamp(info["ts"])
+        meta = " · ".join(x for x in (short(info["cwd"]), long_date(dt.date(), False), info.get("model", "")) if x)
+        w(f"# {info['title']}\n\n> {meta}\n")
+        pend = Counter()
+
+        def flush():
+            if pend:
+                w(f"\n_[{actions_label(pend)}]_\n")
+                pend.clear()
+
+        for o in iter_records(path):
+            t = o.get("type")
+            if o.get("isSidechain"):
+                continue
+            if t == "system" and o.get("subtype") == "compact_boundary":
+                flush()
+                w("\n---\n")
+                continue
+            if t not in ("user", "assistant"):
+                continue
+            ts = o.get("timestamp")
+            for b in blocks(o):
+                bt = b.get("type")
+                if bt in ("tool_use", "server_tool_use"):
+                    pend[b.get("name", "?")] += 1
+                elif bt == "text" and t == "assistant":
+                    if b.get("text", "").strip():
+                        flush()
+                        w(f"\n## Claude ({hhmm(ts)})\n\n{b['text'].strip()}\n")
+                elif bt == "text" and not o.get("isMeta"):
+                    txt = clean(b.get("text", ""))
+                    cmd = COMMAND.search(txt)
+                    if cmd:
+                        flush()
+                        w(f"\n## Commande\n\n`/{cmd.group(1)} {(cmd.group(2) or '').strip()}`\n")
+                    elif txt and not txt.startswith("<"):
+                        flush()
+                        w(f"\n## Toi ({hhmm(ts)})\n\n{txt}\n")
+        flush()
+    except BrokenPipeError:
+        pass
+
+
+def print_stats():
+    ss = sessions()
+    if not ss:
+        print("Aucune conversation dans ~/.claude/projects.")
+        return
+    per_proj = Counter(short(s["cwd"]) for s in ss)
+    per_day = Counter(datetime.fromtimestamp(s["ts"]).date() for s in ss)
+    dates = sorted(datetime.fromtimestamp(s["ts"]).date() for s in ss)
+    total_msgs = sum(s["n"] for s in ss)
+    print(f"{len(ss)} conversations · {total_msgs} messages de toi · {len(per_proj)} dossiers")
+    print(f"de {long_date(dates[0], False)} à {long_date(dates[-1], False)}")
+    day, c = per_day.most_common(1)[0]
+    print(f"Jour le plus actif : {long_date(day, False)} ({c} conversation{'s' if c > 1 else ''})")
+    print("\nDossiers les plus actifs :")
+    for cwd, n in per_proj.most_common(8):
+        print(f"  {n:4d}  {cwd}")
+
+
+def usage(code):
+    print(__doc__.strip(), file=sys.stdout if code == 0 else sys.stderr)
+    return code
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    cmd = argv[0] if argv else ""
+    if cmd in ("-h", "--help", "help"):
+        return usage(0)
+    if cmd == "web" or cmd.isdigit():
+        ports = [a for a in argv if a.isdigit()]
+        serve(int(ports[0]) if ports else 8787, "--no-open" not in argv)
+        return 0
+    load_cache()
+    if not cmd:
+        return pick()
+    if cmd == "last" and len(argv) == 1:
+        ss = sessions()
+        if not ss:
+            err("Aucune conversation dans ~/.claude/projects.")
+            return 1
+        return resume(ss[0])
+    if cmd == "stats" and len(argv) == 1:
+        print_stats()
+        return 0
+    if cmd == "export" and len(argv) == 3:
+        path = session_path(argv[1], argv[2])
+        if not path:
+            return 1
+        write_markdown(path, sys.stdout)
+        try:
+            sys.stdout.flush()
+        except BrokenPipeError:
+            quiet_pipe()
+        return 0
+    if cmd == "list":
+        emit(list_lines())
+        return 0
+    if cmd == "search":
+        emit(search_lines(" ".join(argv[1:]), refresh_index(write=True)))
+        return 0
+    if cmd == "query":  # appelé par fzf à chaque frappe : n'écrit jamais l'index
+        emit(search_lines(" ".join(argv[1:])))
+        return 0
+    if cmd in ("preview", "show") and len(argv) >= 3:
+        if not argv[1] and not argv[2]:  # ligne « Aucune conversation »
+            return 0
+        path = session_path(argv[1], argv[2])
+        if not path:
+            return 1
+        q = argv[3] if len(argv) > 3 else ""
+        if cmd == "show":
+            show(path)
+        elif query_terms(q):
+            write_hits(path, q, sys.stdout)
+        else:
+            write_text(path, sys.stdout)
+        try:
+            sys.stdout.flush()
+        except BrokenPipeError:
+            quiet_pipe()
+        return 0
+    return usage(2)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -35,10 +35,26 @@ Lit `~/.claude/projects` en lecture seule. Dépend de Python 3 (bibliothèque st
 
 Le script pose le lien dans le PATH, construit l'index une fois, et propose d'installer `fzf` s'il manque (pacman, apt, dnf, zypper ou brew). Relançable sans risque.
 
-À la main, si tu préfères :
+### En paquet Python (pipx)
 
 ```
-ln -sf "$PWD/claude-history" ~/.local/bin/claude-history
+pipx install .
+```
+
+Installe la commande `claude-history` dans un environnement isolé, sur n'importe quelle machine.
+
+### En paquet Arch (makepkg)
+
+```
+makepkg -si
+```
+
+Construit et installe le paquet via pacman (`pacman -Q claude-history`, désinstallation avec `pacman -R claude-history`).
+
+### À la main
+
+```
+ln -sf "$PWD/claude_history.py" ~/.local/bin/claude-history
 ```
 
 ## Tests
