@@ -1359,6 +1359,15 @@ def main(argv=None):
         serve(int(ports[0]) if ports else 8787, "--no-open" not in argv)
         return 0
     load_cache()
+    if cmd == "_complete" and len(argv) >= 2:  # appelé par la complétion shell
+        what = argv[1]
+        if what == "commands":
+            print("\n".join(("last", "list", "search", "show", "export", "stats", "web")))
+        elif what == "projects":
+            print("\n".join(sorted({s["project"] for s in sessions()})))
+        elif what == "ids" and len(argv) >= 3:
+            print("\n".join(s["id"] for s in sessions() if s["project"] == argv[2]))
+        return 0
     if not cmd:
         return pick()
     if cmd == "last" and len(argv) == 1:

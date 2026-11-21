@@ -57,6 +57,15 @@ Construit et installe le paquet via pacman (`pacman -Q claude-history`, désinst
 ln -sf "$PWD/claude_history.py" ~/.local/bin/claude-history
 ```
 
+## Complétion (Tab)
+
+`install.sh` installe une complétion zsh et bash. Après avoir rouvert un terminal :
+
+```
+claude-history <Tab>        # last list search show export stats web
+claude-history export <Tab> # tes projets, puis les conversations
+```
+
 ## Tests
 
 ```

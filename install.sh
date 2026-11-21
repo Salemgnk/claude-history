@@ -48,8 +48,29 @@ else
   fi
 fi
 
-# 4. Construire l'index une fois (silencieux)
+# 4. Complétion shell (Tab)
+data="${XDG_DATA_HOME:-$HOME/.local/share}"
+bdir="$data/bash-completion/completions"
+mkdir -p "$bdir"
+install -m644 "$here/completions/claude-history.bash" "$bdir/claude-history"
+say "complétion bash : $bdir/claude-history"
+
+zdir="$data/zsh/site-functions"
+mkdir -p "$zdir"
+install -m644 "$here/completions/_claude-history" "$zdir/_claude-history"
+say "complétion zsh : $zdir/_claude-history"
+rc="$HOME/.zshrc"
+if [ -f "$rc" ] && ! grep -q "claude-history completion" "$rc"; then
+  {
+    echo ""
+    echo "# claude-history completion"
+    echo "fpath=(\"$zdir\" \$fpath); autoload -Uz compinit; compinit"
+  } >> "$rc"
+  say "fpath ajouté à ~/.zshrc (ouvre un nouveau terminal pour l'activer)"
+fi
+
+# 5. Construire l'index une fois (silencieux)
 say "Construction de l'index de recherche..."
 "$here/claude_history.py" search "" >/dev/null 2>&1 || true
 
-say "Terminé. Lance : claude-history"
+say "Terminé. Lance : claude-history (Tab complète les commandes)."

@@ -447,6 +447,29 @@ class TestExtras(Case):
         self.assertTrue(callable(mod.main))
         self.assertEqual(Path(SCRIPT).resolve().name, "claude_history.py")
 
+    def test_complete_commands(self):
+        out = self.run_main("_complete", "commands")[1].split()
+        for c in ("last", "list", "search", "show", "export", "stats", "web"):
+            self.assertIn(c, out)
+
+    def test_complete_projects(self):
+        out = self.run_main("_complete", "projects")[1].split()
+        self.assertEqual(sorted(out), ["proj-a", "proj-b"])
+
+    def test_complete_ids(self):
+        self.assertEqual(self.run_main("_complete", "ids", "proj-a")[1].strip(), "aaa")
+        self.assertEqual(self.run_main("_complete", "ids", "inconnu")[1].strip(), "")
+
+    def test_completion_files(self):
+        comp = Path(SCRIPT).resolve().parent / "completions"
+        z = (comp / "_claude-history").read_text()
+        b = (comp / "claude-history.bash").read_text()
+        self.assertIn("#compdef claude-history", z)
+        self.assertIn("_complete commands", z)
+        self.assertIn("_complete projects", z)
+        self.assertIn("complete -F", b)
+        self.assertIn("_complete commands", b)
+
 
 if __name__ == "__main__":
     unittest.main()
