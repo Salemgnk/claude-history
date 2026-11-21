@@ -338,11 +338,11 @@ class TestCli(Case):
         cd.assert_called_once_with(cwd)
         ex.assert_called_once_with("claude", ["claude", "--resume", "aaa"])
 
-    def test_pick_without_fzf(self):
-        with mock.patch.object(mod.shutil, "which", return_value=None):
-            code, _, err = self.run_main()
-        self.assertEqual(code, 1)
-        self.assertIn("fzf est introuvable", err)
+    def test_pick_falls_back_without_fzf(self):
+        with mock.patch.object(mod.shutil, "which", return_value=None), \
+             mock.patch.object(mod, "pick_plain", return_value=0) as pp:
+            self.assertEqual(self.run_main()[0], 0)
+        pp.assert_called_once()
 
 
 class TestExtras(Case):
@@ -391,6 +391,46 @@ class TestExtras(Case):
         mod.ROOT = self.root / "absent"
         mod.CACHE.clear()
         self.assertEqual(self.run_main("stats")[0], 0)
+
+    def test_found_sessions(self):
+        self.assertEqual([s["id"] for s in mod.found_sessions("")], ["aaa", "bbb"])  # récentes d'abord
+        self.assertEqual([s["id"] for s in mod.found_sessions("wiregu")], ["aaa"])
+        self.assertEqual(mod.found_sessions("zzzz"), [])
+
+    def test_pick_plain_resumes_by_number(self):
+        answers = iter(["wiregu", "1"])
+        with mock.patch.object(mod, "resume", return_value=0) as res:
+            code = mod.pick_plain(read=lambda p="": next(answers))
+        self.assertEqual(code, 0)
+        self.assertEqual(res.call_args[0][0]["id"], "aaa")
+
+    def test_pick_plain_refines_then_quits(self):
+        answers = iter(["pas-de-resultat", "wireguard", ""])  # requête, requête, Entrée = quitter
+        with mock.patch.object(mod, "resume") as res:
+            code = mod.pick_plain(read=lambda p="": next(answers))
+        self.assertEqual(code, 0)
+        res.assert_not_called()
+
+    def test_pick_plain_bad_number_asks_again(self):
+        answers = iter(["99", ""])  # numéro hors liste puis Entrée
+        with mock.patch.object(mod, "resume") as res:
+            code = mod.pick_plain(read=lambda p="": next(answers))
+        self.assertEqual(code, 0)
+        res.assert_not_called()
+
+    def test_pick_uses_fallback_without_fzf(self):
+        with mock.patch.object(mod.shutil, "which", return_value=None), \
+             mock.patch.object(mod, "pick_plain", return_value=0) as pp:
+            self.assertEqual(mod.pick(), 0)
+        pp.assert_called_once()
+
+    def test_install_script(self):
+        sh = (Path(SCRIPT).parent / "install.sh").read_text()
+        self.assertIn(".local/bin", sh)
+        self.assertIn("claude-history", sh)
+        for pm in ("pacman", "apt", "dnf", "brew"):
+            self.assertIn(pm, sh)
+        self.assertIn("fzf", sh)
 
 
 if __name__ == "__main__":

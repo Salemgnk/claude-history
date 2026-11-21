@@ -1174,15 +1174,54 @@ def session_path(project, sid):
     return None
 
 
+def found_sessions(query, limit=25):
+    """Sessions correspondant à la requête (récentes d'abord), ou les plus récentes si vide."""
+    if not query_terms(query):
+        return sessions()[:limit]
+    return [s for s, _, _ in find(query)][:limit]
+
+
+def pick_plain(read=input):
+    """Sélecteur de secours en Python pur, quand fzf n'est pas là."""
+    if not sessions():
+        err("Aucune conversation dans ~/.claude/projects.")
+        return 1
+    refresh_index(write=True, notice=True)
+    print("Tape des mots pour filtrer, un numéro pour reprendre, Entrée pour quitter.")
+    query = ""
+    while True:
+        rows = found_sessions(query)
+        print()
+        if not rows:
+            print(f"Rien pour « {query} ». Essaie d'autres mots.")
+        for i, s in enumerate(rows, 1):
+            d = datetime.fromtimestamp(s["ts"]).date()
+            when = f"{d.day:2d} {ABBR[d.month - 1]}"
+            print(f"{i:2d}. {when}  {one_line(s['title'])[:48]:<48}  {DIM}{short(s['cwd'])}{RST}")
+        try:
+            choice = read(f"\n{PROMPT}").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if not choice:
+            return 0
+        if choice.isdigit():
+            n = int(choice)
+            if 1 <= n <= len(rows):
+                return resume(rows[n - 1])
+            print("Numéro hors de la liste.")
+        else:
+            query = choice
+
+
 def pick():
     lines = list(list_lines())
     if not lines:
         err("Aucune conversation dans ~/.claude/projects.")
         return 1
-    fzf = shutil.which("fzf")
+    fzf = None if os.environ.get("CLAUDE_HISTORY_NO_FZF") else shutil.which("fzf")
     if not fzf:
-        err("fzf est introuvable. Installe-le, ou lance : claude-history web")
-        return 1
+        return pick_plain()
     refresh_index(write=True, notice=True)
     try:
         r = subprocess.run([fzf, *fzf_args(self_cmd())], input="\n".join(lines) + "\n",

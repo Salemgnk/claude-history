@@ -25,9 +25,17 @@ Dans le sélecteur, tape des mots dans n'importe quel ordre. Ils sont cherchés 
 
 L'index de recherche (`~/.cache/claude-history/text.json`) est construit au premier lancement, en quelques secondes, puis mis à jour à chaque lancement pour les seules conversations modifiées.
 
-Lit `~/.claude/projects` en lecture seule. Dépend de Python 3 (bibliothèque standard) et de `fzf`.
+Lit `~/.claude/projects` en lecture seule. Dépend de Python 3 (bibliothèque standard). `fzf` est optionnel : il donne le sélecteur en direct, et sans lui le tool bascule sur un sélecteur intégré en Python.
 
 ## Installation
+
+```
+./install.sh
+```
+
+Le script pose le lien dans le PATH, construit l'index une fois, et propose d'installer `fzf` s'il manque (pacman, apt, dnf, zypper ou brew). Relançable sans risque.
+
+À la main, si tu préfères :
 
 ```
 ln -sf "$PWD/claude-history" ~/.local/bin/claude-history

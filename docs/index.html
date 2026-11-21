@@ -181,8 +181,8 @@ footer a:hover{text-decoration:underline}
       <a class="btn ghost" href="https://github.com/Salemgnk/claude-history" target="_blank" rel="noopener">Voir le code</a>
     </div>
     <div class="install">
-      <span class="p"><b>$</b> ln -sf "$PWD/claude-history" ~/.local/bin/claude-history</span>
-      <button data-copy='ln -sf "$PWD/claude-history" ~/.local/bin/claude-history'>copier</button>
+      <span class="p"><b>$</b> git clone https://github.com/Salemgnk/claude-history.git &amp;&amp; cd claude-history &amp;&amp; ./install.sh</span>
+      <button data-copy='git clone https://github.com/Salemgnk/claude-history.git && cd claude-history && ./install.sh'>copier</button>
     </div>
   </section>
 
@@ -277,8 +277,8 @@ footer a:hover{text-decoration:underline}
   <section id="installer" style="padding-top:10px">
     <div class="lede">
       <div class="kicker">Installer</div>
-      <h2>Trois dependances que tu as deja</h2>
-      <p>Python 3 et sa bibliotheque standard, plus fzf pour le selecteur. Rien d'autre a installer.</p>
+      <h2>Une dependance, et tu l'as deja</h2>
+      <p>Python 3 et sa bibliotheque standard suffisent. fzf est optionnel : il donne le selecteur en direct, et sans lui le tool bascule sur un selecteur integre.</p>
     </div>
     <div class="steps">
       <div class="step">
@@ -287,9 +287,9 @@ footer a:hover{text-decoration:underline}
 <span class="c">cd</span> claude-history</pre>
       </div>
       <div class="step">
-        <h3><span class="n">2</span>Le mettre dans le PATH</h3>
-        <pre><span class="c">ln</span> -sf "$PWD/claude-history" ~/.local/bin/claude-history</pre>
-        <p>Chaque modification du depot est alors active tout de suite.</p>
+        <h3><span class="n">2</span>Lancer le script</h3>
+        <pre><span class="c">./install.sh</span></pre>
+        <p>Il pose le lien dans le PATH, construit l'index, et propose d'installer fzf s'il manque. Relancable sans risque.</p>
       </div>
     </div>
     <div class="note">
