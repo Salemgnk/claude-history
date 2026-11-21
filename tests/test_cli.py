@@ -345,5 +345,53 @@ class TestCli(Case):
         self.assertIn("fzf est introuvable", err)
 
 
+class TestExtras(Case):
+    def run_main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = mod.main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_last_resumes_most_recent(self):
+        with mock.patch.object(mod, "resume", return_value=0) as res:
+            code = mod.main(["last"])
+        self.assertEqual(code, 0)
+        self.assertEqual(res.call_args[0][0]["id"], "aaa")  # la plus récente
+
+    def test_last_without_conversations(self):
+        mod.ROOT = self.root / "absent"
+        mod.CACHE.clear()
+        code, _, err = self.run_main("last")
+        self.assertEqual(code, 1)
+        self.assertIn("Aucune", err)
+
+    def test_export_markdown(self):
+        code, out, _ = self.run_main("export", "proj-a", "aaa")
+        self.assertEqual(code, 0)
+        self.assertIn("# Règles pare-feu WireGuard", out)
+        self.assertIn("## Toi", out)
+        self.assertIn("## Claude", out)
+        self.assertIn("Ta règle forward bloque le réseau.", out)
+        self.assertIn("_[1 action : Bash]_", out)
+        self.assertNotIn("\x1b[", out)  # aucun code couleur
+        for hidden in ("secret", "pensée cachée", "sortie cachée", "sidechain", "wireguard meta"):
+            self.assertNotIn(hidden, out)
+
+    def test_export_bad_id(self):
+        self.assertEqual(self.run_main("export", "../etc", "passwd")[0], 1)
+        self.assertEqual(self.run_main("export", "proj-a", "zzz")[0], 1)
+
+    def test_stats(self):
+        code, out, _ = self.run_main("stats")
+        self.assertEqual(code, 0)
+        self.assertIn("2 conversations", out)
+        self.assertIn("vpn maison", out)
+
+    def test_stats_empty(self):
+        mod.ROOT = self.root / "absent"
+        mod.CACHE.clear()
+        self.assertEqual(self.run_main("stats")[0], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

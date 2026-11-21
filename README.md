@@ -4,9 +4,12 @@ Retrouver et reprendre une conversation Claude Code depuis le terminal, quel que
 
 ```
 claude-history                         sélecteur interactif (fzf)
+claude-history last                    reprendre la conversation la plus récente
 claude-history list                    liste des conversations
 claude-history search <mots>           conversations qui contiennent tous ces <mots>
 claude-history show <projet> <id>      lire une conversation
+claude-history export <projet> <id>    exporter une conversation en Markdown
+claude-history stats                   aperçu de tes conversations
 claude-history web [port] [--no-open]  interface navigateur sur 127.0.0.1
 ```
 
@@ -35,3 +38,7 @@ ln -sf "$PWD/claude-history" ~/.local/bin/claude-history
 ```
 python3 -m unittest discover -s tests -v
 ```
+
+## Page de présentation
+
+`docs/index.html` : une page web qui présente le projet, publiable via GitHub Pages.

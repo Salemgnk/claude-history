@@ -3,9 +3,12 @@
 
 Usage :
   claude-history                         sélecteur interactif (fzf)
+  claude-history last                    reprendre la conversation la plus récente
   claude-history list                    liste des conversations
   claude-history search <mots>           conversations qui contiennent tous ces <mots>
   claude-history show <projet> <id>      lire une conversation
+  claude-history export <projet> <id>    exporter une conversation en Markdown
+  claude-history stats                   aperçu de tes conversations
   claude-history web [port] [--no-open]  interface navigateur sur 127.0.0.1
 
 Dans le sélecteur, tape des mots dans n'importe quel ordre : ils sont cherchés
@@ -1236,6 +1239,72 @@ def show(path):
             quiet_pipe()
 
 
+def write_markdown(path, out):
+    """Écrit une conversation en Markdown propre (sans couleurs), pour la partager."""
+    w = out.write
+    try:
+        _, info = summarize(path)
+        dt = datetime.fromtimestamp(info["ts"])
+        meta = " · ".join(x for x in (short(info["cwd"]), long_date(dt.date(), False), info.get("model", "")) if x)
+        w(f"# {info['title']}\n\n> {meta}\n")
+        pend = Counter()
+
+        def flush():
+            if pend:
+                w(f"\n_[{actions_label(pend)}]_\n")
+                pend.clear()
+
+        for o in iter_records(path):
+            t = o.get("type")
+            if o.get("isSidechain"):
+                continue
+            if t == "system" and o.get("subtype") == "compact_boundary":
+                flush()
+                w("\n---\n")
+                continue
+            if t not in ("user", "assistant"):
+                continue
+            ts = o.get("timestamp")
+            for b in blocks(o):
+                bt = b.get("type")
+                if bt in ("tool_use", "server_tool_use"):
+                    pend[b.get("name", "?")] += 1
+                elif bt == "text" and t == "assistant":
+                    if b.get("text", "").strip():
+                        flush()
+                        w(f"\n## Claude ({hhmm(ts)})\n\n{b['text'].strip()}\n")
+                elif bt == "text" and not o.get("isMeta"):
+                    txt = clean(b.get("text", ""))
+                    cmd = COMMAND.search(txt)
+                    if cmd:
+                        flush()
+                        w(f"\n## Commande\n\n`/{cmd.group(1)} {(cmd.group(2) or '').strip()}`\n")
+                    elif txt and not txt.startswith("<"):
+                        flush()
+                        w(f"\n## Toi ({hhmm(ts)})\n\n{txt}\n")
+        flush()
+    except BrokenPipeError:
+        pass
+
+
+def print_stats():
+    ss = sessions()
+    if not ss:
+        print("Aucune conversation dans ~/.claude/projects.")
+        return
+    per_proj = Counter(short(s["cwd"]) for s in ss)
+    per_day = Counter(datetime.fromtimestamp(s["ts"]).date() for s in ss)
+    dates = sorted(datetime.fromtimestamp(s["ts"]).date() for s in ss)
+    total_msgs = sum(s["n"] for s in ss)
+    print(f"{len(ss)} conversations · {total_msgs} messages de toi · {len(per_proj)} dossiers")
+    print(f"de {long_date(dates[0], False)} à {long_date(dates[-1], False)}")
+    day, c = per_day.most_common(1)[0]
+    print(f"Jour le plus actif : {long_date(day, False)} ({c} conversation{'s' if c > 1 else ''})")
+    print("\nDossiers les plus actifs :")
+    for cwd, n in per_proj.most_common(8):
+        print(f"  {n:4d}  {cwd}")
+
+
 def usage(code):
     print(__doc__.strip(), file=sys.stdout if code == 0 else sys.stderr)
     return code
@@ -1253,6 +1322,25 @@ def main(argv=None):
     load_cache()
     if not cmd:
         return pick()
+    if cmd == "last" and len(argv) == 1:
+        ss = sessions()
+        if not ss:
+            err("Aucune conversation dans ~/.claude/projects.")
+            return 1
+        return resume(ss[0])
+    if cmd == "stats" and len(argv) == 1:
+        print_stats()
+        return 0
+    if cmd == "export" and len(argv) == 3:
+        path = session_path(argv[1], argv[2])
+        if not path:
+            return 1
+        write_markdown(path, sys.stdout)
+        try:
+            sys.stdout.flush()
+        except BrokenPipeError:
+            quiet_pipe()
+        return 0
     if cmd == "list":
         emit(list_lines())
         return 0
