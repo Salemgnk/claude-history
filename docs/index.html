@@ -132,7 +132,11 @@ section{padding:60px 0}
 @media(max-width:620px){.cmd{grid-template-columns:1fr;gap:5px}}
 
 /* install block */
-.steps{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:36px}
+.oneliner{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;margin-top:26px;background:var(--code);border:1px solid var(--line);border-radius:12px;padding:14px 16px;font-family:var(--mono)}
+.oneliner code{font-size:13px;color:var(--ink);overflow-x:auto}
+.oneliner code .c{color:var(--petrol)}
+.oneliner .when{color:var(--coral);font-size:12.5px;font-family:var(--body)}
+.steps{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:20px}
 .step{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:22px}
 .step h3{font-size:16px;font-family:var(--display);display:flex;align-items:center;gap:10px}
 .step h3 .n{width:24px;height:24px;border-radius:7px;background:var(--petrol);color:var(--paper);display:grid;place-items:center;font-size:13px;font-family:var(--mono)}
@@ -284,6 +288,10 @@ footer a:hover{text-decoration:underline}
       <div class="kicker">Installer</div>
       <h2>Une dependance, et tu l'as deja</h2>
       <p>Python 3 et sa bibliotheque standard suffisent. fzf est optionnel : il donne le selecteur en direct, et sans lui le tool bascule sur un selecteur integre.</p>
+    </div>
+    <div class="oneliner">
+      <code><span class="c">curl</span> -fsSL https://raw.githubusercontent.com/Salemgnk/claude-history/main/install.sh | bash</code>
+      <span class="when">des que le depot est public</span>
     </div>
     <div class="steps">
       <div class="step">

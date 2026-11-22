@@ -29,11 +29,19 @@ Lit `~/.claude/projects` en lecture seule. Dépend de Python 3 (bibliothèque st
 
 ## Installation
 
+En une ligne (une fois le dépôt public) :
+
+```
+curl -fsSL https://raw.githubusercontent.com/Salemgnk/claude-history/main/install.sh | bash
+```
+
+Ou depuis le dépôt cloné :
+
 ```
 ./install.sh
 ```
 
-Le script pose le lien dans le PATH, construit l'index une fois, et propose d'installer `fzf` s'il manque (pacman, apt, dnf, zypper ou brew). Relançable sans risque.
+Le script est le même : lancé par `curl | bash`, il clone le dépôt dans `~/.local/share/claude-history-src` puis s'installe. Il pose le lien dans le PATH, construit l'index une fois, installe la complétion Tab, et propose d'installer `fzf` s'il manque (pacman, apt, dnf, zypper ou brew). Relançable sans risque.
 
 ### En paquet Python (pipx)
 

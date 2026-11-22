@@ -3,7 +3,27 @@
 # Relançable sans risque.
 set -euo pipefail
 
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+src="${BASH_SOURCE[0]:-$0}"
+here="$(cd "$(dirname "$src")" 2>/dev/null && pwd || true)"
+
+# Lancé via « curl -fsSL .../install.sh | bash » : pas de fichiers sous la main,
+# on clone le dépôt puis on relance l'install depuis la copie.
+if [ -z "${here:-}" ] || [ ! -f "$here/claude_history.py" ]; then
+  if ! command -v git >/dev/null 2>&1; then
+    echo "git est nécessaire pour cette installation." >&2
+    exit 1
+  fi
+  repo="https://github.com/Salemgnk/claude-history.git"
+  dest="${XDG_DATA_HOME:-$HOME/.local/share}/claude-history-src"
+  echo "Récupération de claude-history dans $dest..."
+  if [ -d "$dest/.git" ]; then
+    git -C "$dest" pull --ff-only -q || true
+  else
+    git clone -q "$repo" "$dest"
+  fi
+  exec bash "$dest/install.sh"
+fi
+
 bin="${XDG_BIN_HOME:-$HOME/.local/bin}"
 
 say() { printf '  %s\n' "$*"; }
