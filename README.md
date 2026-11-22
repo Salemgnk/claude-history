@@ -29,7 +29,7 @@ Lit `~/.claude/projects` en lecture seule. Dépend de Python 3 (bibliothèque st
 
 ## Installation
 
-En une ligne (une fois le dépôt public) :
+En une ligne :
 
 ```
 curl -fsSL https://raw.githubusercontent.com/Salemgnk/claude-history/main/install.sh | bash
